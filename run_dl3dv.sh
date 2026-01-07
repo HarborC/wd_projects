@@ -4,12 +4,11 @@
 # Dedicated to running simple_trainer_deblur.py across all scenes
 
 # Base paths
-BASE_DIR="/home/disk2/jiagangchen/wd_projects/render/"
-DATA_DIR="/home/disk2/jiagangchen/wd_projects/test_reconstruction_output"
+DATA_DIR="test_reconstruction_output"
 RESULTS_DIR="$DATA_DIR/render_results"
 
 # Script path
-SCRIPT_TRAINER="$BASE_DIR/simple_deblur_difix.py"
+SCRIPT_TRAINER="render/simple_deblur_difix.py"
 
 # Set GPU device
 export CUDA_VISIBLE_DEVICES=1
@@ -89,7 +88,6 @@ check_dependencies
 mkdir -p "$RESULTS_DIR"
 
 # Run training
-cd "$BASE_DIR"
 TRAJ_TYPE="off"
     #--virtual-view-st--virtual-view-start-step 2000 \
     #   --virtual-view-interval 250 art-step 1500 \
@@ -103,4 +101,5 @@ python "$SCRIPT_TRAINER" default \
     --virtual-view-interval 200 \
     --max-steps 7000 \
     --camera-optimizer.mode $TRAJ_TYPE \
-    2>&1 | tee "${RESULTS_DIR}_training.log"
+    --init-ply-path "$DATA_DIR/gaussians.ply" \
+    2>&1 | tee "${RESULTS_DIR}/training.log"

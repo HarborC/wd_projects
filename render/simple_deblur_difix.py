@@ -25,6 +25,7 @@ import viser
 from typing_extensions import Literal
 from dataclasses import dataclass, field
 from pytorch_msssim import ssim as pytorch_ssim
+from gsplat import export_splats
 from gsplat.distributed import cli
 from gsplat.strategy import DefaultStrategy, MCMCStrategy
 from nerfview.viewer import Viewer
@@ -53,6 +54,7 @@ from utils import (
     CameraOptModuleSE3,
     CameraOptModule,
     set_random_seed,
+    rgb_to_sh,
 )
 
 from pection_loss import VGG16PerceptualLoss, VGG16PerceptualLossWithMultipleLayers, VGG16DISTSLoss
@@ -90,6 +92,10 @@ class DeblurDiFix3DConfig(Config):
     max_steps: int = 30000
     eval_steps: List[int] = field(default_factory=lambda: [1_000, 3_000, 7_000])
     save_steps: List[int] = field(default_factory=lambda: [1_000, 3_000, 7_000])
+    # Whether to save ply file (storage size can be large)
+    save_ply: bool = True
+    # Steps to save the model as ply
+    ply_steps: List[int] = field(default_factory=lambda: [1_000, 7_000, 30_000])
     
     # Use fused SSIM optimization
     fused_ssim: bool = False
@@ -1179,6 +1185,8 @@ class DeblurDiFix3DRunner(Runner):
         os.makedirs(self.stats_dir, exist_ok=True)
         self.render_dir = f"{cfg.result_dir}/renders"
         os.makedirs(self.render_dir, exist_ok=True)
+        self.ply_dir = f"{cfg.result_dir}/ply"
+        os.makedirs(self.ply_dir, exist_ok=True)
         # DiFix3D comparison directory
         self.difix3d_comparison_dir = f"{cfg.result_dir}/difix3d_comparisons"
         os.makedirs(self.difix3d_comparison_dir, exist_ok=True)
@@ -1536,6 +1544,13 @@ class DeblurDiFix3DRunner(Runner):
         if world_rank == 0:
             print("Start collecting training camera poses...")
             self.collect_train_camera_data()
+
+            # Save initialization PLY and render trajectory
+            print("Saving initialization ply and rendering trajectory...")
+            if cfg.save_ply:
+                self.save_gsply(0)
+            
+            self.render_traj(step=0)
 
         # Training loop.
         global_tic = time.time()
@@ -1918,6 +1933,9 @@ class DeblurDiFix3DRunner(Runner):
                         data["app_module"] = self.app_module.state_dict()
                 torch.save(data, f"{self.ckpt_dir}/ckpt_{step}_rank{self.world_rank}.pt")
 
+            if (step in [i - 1 for i in cfg.ply_steps] or step == max_steps - 1) and cfg.save_ply:
+                self.save_gsply(step)
+
             if isinstance(self.cfg.strategy, DefaultStrategy):
                 self.cfg.strategy.step_post_backward(
                     params=self.splats,
@@ -2003,8 +2021,41 @@ class DeblurDiFix3DRunner(Runner):
                         positions = batch[:, :3, 3].cpu().numpy()
 
             
-            if self.difix3d_processor is not None:
-                self.difix3d_processor.save_quality_scores_to_json(step=max_steps-1, result_dir=self.result_dir)
+            # if self.difix3d_processor is not None:
+            #     self.difix3d_processor.save_quality_scores_to_json(step=max_steps-1, result_dir=self.result_dir)
+
+
+    def save_gsply(self, step: int = 0):
+        if self.cfg.app_opt:
+            # eval at origin to bake the appeareance into the colors
+            rgb = self.app_module(
+                features=self.splats["features"],
+                embed_ids=None,
+                dirs=torch.zeros_like(self.splats["means"][None, :, :]),
+                sh_degree=sh_degree_to_use,
+            )
+            rgb = rgb + self.splats["colors"]
+            rgb = torch.sigmoid(rgb).squeeze(0).unsqueeze(1)
+            sh0 = rgb_to_sh(rgb)
+            shN = torch.empty([sh0.shape[0], 0, 3], device=sh0.device)
+        else:
+            sh0 = self.splats["sh0"]
+            shN = self.splats["shN"]
+
+        means = self.splats["means"]
+        scales = self.splats["scales"]
+        quats = self.splats["quats"]
+        opacities = self.splats["opacities"]
+        export_splats(
+            means=means,
+            scales=scales,
+            quats=quats,
+            opacities=opacities,
+            sh0=sh0,
+            shN=shN,
+            format="ply",
+            save_to=f"{self.ply_dir}/point_cloud_{step}.ply",
+        )
 
 
     @torch.no_grad()

@@ -363,8 +363,9 @@ if __name__ == '__main__':
     sys.exit(main())
 
 """
+export CUDA_VISIBLE_DEVICES=1 
 python -m undistortion.factory \
-    --input-dir /home/disk2/jiagangchen/LJ/process_data/first_frames \
+    --input-dir ./data/data1 \
     --output-dir ./test_undistort_output \
     --intrinsics ./test_undistort_output/intrinsics.json \
     --device cuda

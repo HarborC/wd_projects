@@ -53,7 +53,7 @@ from gsplat.compression import PngCompression
 from gsplat.distributed import cli
 from gsplat.rendering import rasterization
 from gsplat.strategy import DefaultStrategy, MCMCStrategy
-
+from gsplat import export_splats
 
 @dataclass
 class Config:
@@ -97,6 +97,10 @@ class Config:
     eval_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
     # Steps to save the model
     save_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
+    # Whether to save ply file (storage size can be large)
+    save_ply: bool = True
+    # Steps to save the model as ply
+    ply_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
 
     # Initialization strategy
     init_type: Literal["random", "sfm", "gsply"] = "sfm"
@@ -211,7 +215,7 @@ def create_splats_with_optimizers(
     world_size: int = 1,
     ply_path: Optional[str] = None,
 ) -> Tuple[torch.nn.ParameterDict, Dict[str, torch.optim.Optimizer]]:
-    if init_type == "ply":
+    if init_type == "gsply":
         from plyfile import PlyData
 
         if ply_path is None:
@@ -330,6 +334,8 @@ class Runner:
         os.makedirs(self.stats_dir, exist_ok=True)
         self.render_dir = f"{cfg.result_dir}/renders"
         os.makedirs(self.render_dir, exist_ok=True)
+        self.ply_dir = f"{cfg.result_dir}/ply"
+        os.makedirs(self.ply_dir, exist_ok=True)
 
         # Tensorboard
         self.writer = SummaryWriter(log_dir=f"{cfg.result_dir}/tb")
@@ -845,6 +851,38 @@ class Runner:
                     else:
                         data["app_module"] = self.app_module.state_dict()
                 torch.save(data, f"{self.ckpt_dir}/ckpt_{step}_rank{self.world_rank}.pt")
+
+            if (step in [i - 1 for i in cfg.ply_steps] or step == max_steps - 1) and cfg.save_ply:
+                if self.cfg.app_opt:
+                    # eval at origin to bake the appeareance into the colors
+                    rgb = self.app_module(
+                        features=self.splats["features"],
+                        embed_ids=None,
+                        dirs=torch.zeros_like(self.splats["means"][None, :, :]),
+                        sh_degree=sh_degree_to_use,
+                    )
+                    rgb = rgb + self.splats["colors"]
+                    rgb = torch.sigmoid(rgb).squeeze(0).unsqueeze(1)
+                    sh0 = rgb_to_sh(rgb)
+                    shN = torch.empty([sh0.shape[0], 0, 3], device=sh0.device)
+                else:
+                    sh0 = self.splats["sh0"]
+                    shN = self.splats["shN"]
+
+                means = self.splats["means"]
+                scales = self.splats["scales"]
+                quats = self.splats["quats"]
+                opacities = self.splats["opacities"]
+                export_splats(
+                    means=means,
+                    scales=scales,
+                    quats=quats,
+                    opacities=opacities,
+                    sh0=sh0,
+                    shN=shN,
+                    format="ply",
+                    save_to=f"{self.ply_dir}/point_cloud_{step}.ply",
+                )
 
             if isinstance(self.cfg.strategy, DefaultStrategy):
                 self.cfg.strategy.step_post_backward(

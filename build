@@ -10,3 +10,7 @@ python simple_inference.py \
     --checkpoint pretrained_weights/re10k_spfsplatv2l_10view.ckpt \
     --encoder_type spfsplatv2-l \
     --output_dir output/my_test_result
+
+conda create -n wd python=3.10
+conda activate wd
+pip install torch==2.7.0 torchvision==0.22.0 torchaudio==2.7.0 xformers==0.0.30 --index-url https://download.pytorch.org/whl/cu128

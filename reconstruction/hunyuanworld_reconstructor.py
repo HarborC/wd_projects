@@ -230,6 +230,9 @@ class HunyuanWorldReconstructor(BaseReconstructor):
             ply_path = hunyuanworld_gs_dir / "gaussians.ply"
             save_gs_ply(ply_path, means, scales, quats, colors, opacities)
 
+            ply_path = output_path / "gaussians.ply"
+            save_gs_ply(ply_path, means, scales, quats, colors, opacities)
+
             # Render video using the same filtered splats from predictions
             num_views = S
             e4x4 = predictions['camera_poses']
