@@ -1,0 +1,12 @@
+export CUDA_HOME=$CONDA_PREFIX
+pip install submodules/diff-gaussian-rasterization-softmax --no-build-isolation
+
+cd /home/disk2/jiagangchen/LJ/sparse_view/SparseGS
+python3 train.py --source_path /home/disk2/jiagangchen/wd_projects/test_data/reconstruction_output --model_path /home/disk2/jiagangchen/wd_projects/test_data/gs_output --beta 5.0 --lambda_pearson 0.05 --lambda_local_pearson 0.15 --box_p 128 --p_corr 0.5 --lambda_diffusion 0.001 --SDS_freq 0.1 --step_ratio 0.99 --lambda_reg 0.1 --prune_sched 20000 --prune_perc 0.98 --prune_exp 7.5 --iterations 30000 --checkpoint_iterations 30000 -r 2
+
+
+python simple_inference.py \
+    --image_dir /home/disk2/jiagangchen/wd_projects/test_data/undistorted_first_frames/images \
+    --checkpoint pretrained_weights/re10k_spfsplatv2l_10view.ckpt \
+    --encoder_type spfsplatv2-l \
+    --output_dir output/my_test_result
