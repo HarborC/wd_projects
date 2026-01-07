@@ -1009,8 +1009,19 @@ class Runner:
 
         # 对于稀疏视角实验，只使用训练视角对应的位姿
         # 训练集使用的索引是 [5, 15, 25]，所以渲染轨迹也应该限制在这些视角之间
-        train_indices = [5,15]  # 与 colmap.py 中 Dataset 类的训练索引保持一致
+        # train_indices = [5,15]  # 与 colmap.py 中 Dataset 类的训练索引保持一致
         #train_indices = [5,6,15,24,25]
+        
+        if hasattr(cfg, "train_indices") and cfg.train_indices is not None:
+             train_indices = cfg.train_indices
+        else:
+             train_indices = np.arange(len(self.parser.camtoworlds))
+
+        # Ensure indices are valid
+        train_indices = [i for i in train_indices if 0 <= i < len(self.parser.camtoworlds)]
+        if not train_indices:
+             train_indices = np.arange(len(self.parser.camtoworlds))
+             
         camtoworlds_all = self.parser.camtoworlds[train_indices]
         if cfg.render_traj_path == "interp":
             # 增加插值密度，生成更多帧数

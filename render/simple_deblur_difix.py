@@ -51,6 +51,7 @@ from lib_bilagrid import (
 from utils import (
     AppearanceOptModule,
     CameraOptModuleSE3,
+    CameraOptModule,
     set_random_seed,
 )
 
@@ -230,7 +231,11 @@ class DeblurDiFix3DConfig(Config):
             timestr = time.strftime("%Y%m%d-%H%M%S")
             self.result_dir = Path(self.result_dir) / timestr
             if isinstance(self.strategy, DefaultStrategy):
-                self.strategy.grow_grad2d = self.strategy.grow_grad2d / self.camera_optimizer.num_virtual_views
+                if self.camera_optimizer.mode == "off":
+                    div_factor = 1.0
+                else:
+                    div_factor = self.camera_optimizer.num_virtual_views
+                self.strategy.grow_grad2d = self.strategy.grow_grad2d / div_factor
                 self.strategy.reset_every = 999999999
 
 
@@ -1287,18 +1292,36 @@ class DeblurDiFix3DRunner(Runner):
         self.pose_optimizers = []
         # Total camera count across train/val/test
         total_cameras = len(self.trainset) + (len(self.valset) if self.valset else 0) + (len(self.testset) if self.testset else 0)
-        self.camera_optimizer: BadCameraOptimizer = self.cfg.camera_optimizer.setup(
-            num_cameras=total_cameras,
-            device=self.device,
-        )
+        
+        # Check if we should fallback to standard CameraOptModule
+        use_static_pose_opt = (self.cfg.camera_optimizer.mode == "off" and cfg.pose_opt)
+        
+        if use_static_pose_opt:
+            print("Switching to CameraOptModule for static pose optimization (mode=off, pose_opt=True)")
+            # Force virtual views to 1 since we are doing static optimization
+            self.cfg.camera_optimizer.num_virtual_views = 1
+            self.camera_optimizer = CameraOptModule(total_cameras).to(self.device)
+            self.camera_optimizer.zero_init()
+        else:
+            self.camera_optimizer: BadCameraOptimizer = self.cfg.camera_optimizer.setup(
+                num_cameras=total_cameras,
+                device=self.device,
+            )
+            
         camera_optimizer_param_groups = {}
         # Handle DDP-wrapped module
         camera_optimizer = self.camera_optimizer.module if hasattr(self.camera_optimizer, 'module') else self.camera_optimizer
-        camera_optimizer.get_param_groups(camera_optimizer_param_groups)
+        
+        if isinstance(camera_optimizer, CameraOptModule):
+            params = list(camera_optimizer.parameters())
+        else:
+            camera_optimizer.get_param_groups(camera_optimizer_param_groups)
+            params = camera_optimizer_param_groups["camera_opt"]
+        
         if cfg.pose_opt:
             self.pose_optimizers = [
                 torch.optim.Adam(
-                    camera_optimizer_param_groups["camera_opt"],
+                    params,
                     lr=cfg.pose_opt_lr * math.sqrt(cfg.batch_size),
                     weight_decay=cfg.pose_opt_reg,
                 )
@@ -1544,7 +1567,12 @@ class DeblurDiFix3DRunner(Runner):
 
             assert camtoworlds.shape[0] == 1
             camera_optimizer = self.camera_optimizer.module if hasattr(self.camera_optimizer, 'module') else self.camera_optimizer
-            camtoworlds = camera_optimizer.apply_to_cameras(camtoworlds, image_ids, "uniform")[0]
+            
+            if isinstance(camera_optimizer, CameraOptModule):
+                camtoworlds = camera_optimizer(camtoworlds, image_ids)
+            else:
+                camtoworlds = camera_optimizer.apply_to_cameras(camtoworlds, image_ids, "uniform")[0]
+            
             assert camtoworlds.shape[0] == cfg.camera_optimizer.num_virtual_views
             Ks = Ks.tile((camtoworlds.shape[0], 1, 1))
             
@@ -1841,7 +1869,8 @@ class DeblurDiFix3DRunner(Runner):
                 metrics_dict = {}
                 # Handle DDP-wrapped module
                 camera_optimizer = self.camera_optimizer.module if hasattr(self.camera_optimizer, 'module') else self.camera_optimizer
-                camera_optimizer.get_metrics_dict(metrics_dict)
+                if hasattr(camera_optimizer, "get_metrics_dict"):
+                    camera_optimizer.get_metrics_dict(metrics_dict)
                 for k, v in metrics_dict.items():
                     self.writer.add_scalar(f"train/{k}", v, step)
 
