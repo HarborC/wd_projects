@@ -99,7 +99,9 @@ class Config:
     save_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
 
     # Initialization strategy
-    init_type: Literal["random", "sfm"] = "sfm"
+    init_type: Literal["random", "sfm", "gsply"] = "sfm"
+    # Path of the ply file for initialization
+    init_ply_path: Optional[str] = None
     # Initial number of GSs. Ignored if using sfm
     init_num_pts: int = 100_000
     # Initial extent of GSs as a multiple of the camera extent. Ignored if using sfm
@@ -207,29 +209,65 @@ def create_splats_with_optimizers(
     device: str = "cuda",
     world_rank: int = 0,
     world_size: int = 1,
+    ply_path: Optional[str] = None,
 ) -> Tuple[torch.nn.ParameterDict, Dict[str, torch.optim.Optimizer]]:
-    if init_type == "sfm":
-        points = torch.from_numpy(parser.points).float()
-        rgbs = torch.from_numpy(parser.points_rgb / 255.0).float()
-    elif init_type == "random":
-        points = init_extent * scene_scale * (torch.rand((init_num_pts, 3)) * 2 - 1)
-        rgbs = torch.rand((init_num_pts, 3))
+    if init_type == "ply":
+        from plyfile import PlyData
+
+        if ply_path is None:
+            raise ValueError("ply_path needed for ply init")
+        plydata = PlyData.read(ply_path)
+        v = plydata["vertex"]
+        points = np.stack([v["x"], v["y"], v["z"]], axis=-1)
+        points = torch.from_numpy(points).float()
+
+        opacities = torch.from_numpy(v["opacity"]).float()
+        opacities = torch.logit(opacities)
+
+        s_keys = [f"scale_{i}" for i in range(3)]
+        scales = np.stack([v[k] for k in s_keys], axis=-1)
+        scales = torch.from_numpy(scales).float()
+
+        r_keys = [f"rot_{i}" for i in range(4)]
+        quats = np.stack([v[k] for k in r_keys], axis=-1)
+        quats = torch.from_numpy(quats).float()
+
+        c_keys = [f"f_dc_{i}" for i in range(3)]
+        rgbs = np.stack([v[k] for k in c_keys], axis=-1)
+        rgbs = torch.from_numpy(rgbs).float()
+
+        # Distribute the GSs to different ranks (also works for single rank)
+        points = points[world_rank::world_size]
+        rgbs = rgbs[world_rank::world_size]
+        scales = scales[world_rank::world_size]
+        quats = quats[world_rank::world_size]
+        opacities = opacities[world_rank::world_size]
+
+        N = points.shape[0]
+
     else:
-        raise ValueError("Please specify a correct init_type: sfm or random")
+        if init_type == "sfm":
+            points = torch.from_numpy(parser.points).float()
+            rgbs = torch.from_numpy(parser.points_rgb / 255.0).float()
+        elif init_type == "random":
+            points = init_extent * scene_scale * (torch.rand((init_num_pts, 3)) * 2 - 1)
+            rgbs = torch.rand((init_num_pts, 3))
+        else:
+            raise ValueError("Please specify a correct init_type: sfm or random")
 
-    # Initialize the GS size to be the average dist of the 3 nearest neighbors
-    dist2_avg = (knn(points, 4)[:, 1:] ** 2).mean(dim=-1)  # [N,]
-    dist_avg = torch.sqrt(dist2_avg)
-    scales = torch.log(dist_avg * init_scale).unsqueeze(-1).repeat(1, 3)  # [N, 3]
+        # Initialize the GS size to be the average dist of the 3 nearest neighbors
+        dist2_avg = (knn(points, 4)[:, 1:] ** 2).mean(dim=-1)  # [N,]
+        dist_avg = torch.sqrt(dist2_avg)
+        scales = torch.log(dist_avg * init_scale).unsqueeze(-1).repeat(1, 3)  # [N, 3]
 
-    # Distribute the GSs to different ranks (also works for single rank)
-    points = points[world_rank::world_size]
-    rgbs = rgbs[world_rank::world_size]
-    scales = scales[world_rank::world_size]
+        # Distribute the GSs to different ranks (also works for single rank)
+        points = points[world_rank::world_size]
+        rgbs = rgbs[world_rank::world_size]
+        scales = scales[world_rank::world_size]
 
-    N = points.shape[0]
-    quats = torch.rand((N, 4))  # [N, 4]
-    opacities = torch.logit(torch.full((N,), init_opacity))  # [N,]
+        N = points.shape[0]
+        quats = torch.rand((N, 4))  # [N, 4]
+        opacities = torch.logit(torch.full((N,), init_opacity))  # [N,]
 
     params = [
         # name, value, lr
@@ -330,6 +368,7 @@ class Runner:
             device=self.device,
             world_rank=world_rank,
             world_size=world_size,
+            ply_path=cfg.init_ply_path,
         )
         print("Model initialized. Number of GS:", len(self.splats["means"]))
 

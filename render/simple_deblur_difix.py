@@ -22,6 +22,7 @@ import torch.nn.functional as F
 import tqdm
 import tyro
 import viser
+from typing_extensions import Literal
 from dataclasses import dataclass, field
 from pytorch_msssim import ssim as pytorch_ssim
 from gsplat.distributed import cli
@@ -74,10 +75,10 @@ class DeblurDiFix3DConfig(Config):
     
     # Evaluation settings
     eval_only: bool = False
-    eval_steps: List[int] = field(default_factory=lambda: [3_000, 7_000])
+    eval_steps: List[int] = field(default_factory=lambda: [1_000, 3_000, 7_000])
     scale_factor: float = 1.0
     result_dir: str = "path_of_your_result"
-    test_every: int = 8
+    test_every: int = 0
 
     ########### Viewer ###############
     disable_viewer: bool = False
@@ -86,8 +87,8 @@ class DeblurDiFix3DConfig(Config):
 
     ########### Training ###############
     max_steps: int = 30000
-    eval_steps: List[int] = field(default_factory=lambda: [3_000, 7_000])
-    save_steps: List[int] = field(default_factory=lambda: [3_000, 7_000])
+    eval_steps: List[int] = field(default_factory=lambda: [1_000, 3_000, 7_000])
+    save_steps: List[int] = field(default_factory=lambda: [1_000, 3_000, 7_000])
     
     # Use fused SSIM optimization
     fused_ssim: bool = False
@@ -101,12 +102,13 @@ class DeblurDiFix3DConfig(Config):
     steps_scaler: float = 1.0
     
     ########### Gaussian Initialization ###############
-    init_type: str = "sfm"  # "sfm" or "random"
+    init_type: Literal["random", "sfm", "gsply"] = "sfm"
     init_num_pts: int = 100_000
     init_extent: float = 3.0
     init_opa: float = 0.1
     init_scale: float = 1.0
     global_scale: float = 1.0
+    init_ply_path: Optional[str] = None
     
     ########### Spherical Harmonics ###############
     sh_degree: int = 3
@@ -147,7 +149,6 @@ class DeblurDiFix3DConfig(Config):
 
     difix3d_blend_ratio: float = 1.0
 
-    
     difix3d_num_inference_steps: int = 1
 
     difix3d_guidance_scale: float = 0.0
@@ -164,14 +165,12 @@ class DeblurDiFix3DConfig(Config):
 
     virtual_view_interval: int = 250
 
-    
     virtual_view_poses_per_step: int = 2
 
-    
     virtual_view_loss_weight: float = 0.1
 
-
     interp_quality_psnr_min: float = 4.5
+
     interp_quality_psnr_max: float = 14.5
     
     ########### Camera Opt ###############
@@ -222,7 +221,6 @@ class DeblurDiFix3DConfig(Config):
     difix_enhancement_l1_weight: float = 0.8
     difix_enhancement_perceptual_weight: float = 0.2
 
-    
     # Avoid multiple initialization
     bad_gaussians_post_init_complete: bool = False
 
@@ -1271,6 +1269,7 @@ class DeblurDiFix3DRunner(Runner):
             device=self.device,
             world_rank=world_rank,
             world_size=world_size,
+            ply_path=cfg.init_ply_path,
         )
         print(len(self.splats["means"]))
 
@@ -1296,13 +1295,14 @@ class DeblurDiFix3DRunner(Runner):
         # Handle DDP-wrapped module
         camera_optimizer = self.camera_optimizer.module if hasattr(self.camera_optimizer, 'module') else self.camera_optimizer
         camera_optimizer.get_param_groups(camera_optimizer_param_groups)
-        self.pose_optimizers = [
-            torch.optim.Adam(
-                camera_optimizer_param_groups["camera_opt"],
-                lr=cfg.pose_opt_lr * math.sqrt(cfg.batch_size),
-                weight_decay=cfg.pose_opt_reg,
-            )
-        ]
+        if cfg.pose_opt:
+            self.pose_optimizers = [
+                torch.optim.Adam(
+                    camera_optimizer_param_groups["camera_opt"],
+                    lr=cfg.pose_opt_lr * math.sqrt(cfg.batch_size),
+                    weight_decay=cfg.pose_opt_reg,
+                )
+            ]
         if world_size > 1:
             self.camera_optimizer = DDP(self.camera_optimizer)
 
@@ -1473,10 +1473,11 @@ class DeblurDiFix3DRunner(Runner):
         ]
         
         # pose optimization has a learning rate schedule
-        pose_scheduler = torch.optim.lr_scheduler.ExponentialLR(
-            self.pose_optimizers[0], gamma=cfg.pose_opt_lr_decay ** (1.0 / max_steps)
-        )
-        schedulers.append(pose_scheduler)
+        if cfg.pose_opt:
+            pose_scheduler = torch.optim.lr_scheduler.ExponentialLR(
+                self.pose_optimizers[0], gamma=cfg.pose_opt_lr_decay ** (1.0 / max_steps)
+            )
+            schedulers.append(pose_scheduler)
 
         if cfg.use_bilateral_grid:
             # bilateral grid has a learning rate schedule. Linear warmup for 1000 steps.
@@ -1680,7 +1681,7 @@ class DeblurDiFix3DRunner(Runner):
                     if enhanced_image.dim() == 3:
                         enhanced_image = enhanced_image.unsqueeze(0)  # [1, H, W, 3]
                     
-                    #  Compute DiFix distillation loss: distill enhanced image into render
+                    # Compute DiFix distillation loss: distill enhanced image into render
                     difix_distillation_loss = 0.0
                     if cfg.enable_difix_enhancement_loss:
                         # L1 loss
