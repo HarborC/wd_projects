@@ -563,7 +563,6 @@ class DeblurDiFix3DRunner(Runner):
                     print(f"   Tensor devices: {[pose.device for pose in virtual_poses]}")
                     raise e
 
-
     def _save_config(self):
         """Save configuration to file."""
         if self.world_rank == 0:
@@ -709,27 +708,140 @@ class DeblurDiFix3DRunner(Runner):
             
         return loss_value
 
+    def _optimization_step(self, step: int, loss: torch.Tensor, info: dict, schedulers: list, Ks: torch.Tensor):
+        """Execute backward pass and optimization step."""
+        loss.backward()
+        
+        cfg = self.cfg
+        
+        # Strategy post-backward
+        if isinstance(self.cfg.strategy, DefaultStrategy):
+            self.cfg.strategy.step_post_backward(
+                params=self.splats,
+                optimizers=self.optimizers,
+                state=self.strategy_state,
+                step=step,
+                info=info,
+                packed=cfg.packed,
+            )
+        elif isinstance(self.cfg.strategy, MCMCStrategy):
+             self.cfg.strategy.step_post_backward(
+                params=self.splats,
+                optimizers=self.optimizers,
+                state=self.strategy_state,
+                step=step,
+                info=info,
+                lr=schedulers[0].get_last_lr()[0],
+            )
+
+        # Sparse Gradients Handling
+        if cfg.sparse_grad:
+            assert cfg.packed, "Sparse gradients only work with packed mode."
+            gaussian_ids = info["gaussian_ids"]
+            for k in self.splats.keys():
+                grad = self.splats[k].grad
+                if grad is None or grad.is_sparse: continue
+                self.splats[k].grad = torch.sparse_coo_tensor(
+                    indices=gaussian_ids[None],
+                    values=grad[gaussian_ids],
+                    size=self.splats[k].size(),
+                    is_coalesced=len(Ks) == 1,
+                )
+
+        # Optimizer steps
+        for optimizer in self.optimizers.values():
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+            
+        for optimizer in self.pose_optimizers:
+            if step % cfg.pose_gradient_accumulation_steps == cfg.pose_gradient_accumulation_steps - 1:
+                optimizer.step()
+            if step % cfg.pose_gradient_accumulation_steps == 0:
+                optimizer.zero_grad(set_to_none=True)
+                
+        for optimizer in self.app_optimizers:
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+            
+        for optimizer in self.bil_grid_optimizers:
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+            
+        for scheduler in schedulers:
+            if scheduler is not None:
+                scheduler.step()
+
+    def _log_and_checkpoint(self, step: int, max_steps: int, loss_items: dict, schedulers: list):
+        """Handle logging and checkpointing."""
+        cfg = self.cfg
+        
+        # Tensorboard logging
+        if self.world_rank == 0 and cfg.tb_every > 0 and step % cfg.tb_every == 0:
+            mem = torch.cuda.max_memory_allocated() / 1024**3
+            self.writer.add_scalar("train/loss", loss_items['loss'], step)
+            self.writer.add_scalar("train/l1loss", loss_items['l1loss'], step)
+            self.writer.add_scalar("train/ssimloss", loss_items['ssimloss'], step)
+            self.writer.add_scalar("train/num_GS", len(self.splats["means"]), step)
+            self.writer.add_scalar("train/mem", mem, step)
+            
+            # Monitor camera pose optimization
+            metrics_dict = {}
+            camera_optimizer = self.camera_optimizer.module if hasattr(self.camera_optimizer, 'module') else self.camera_optimizer
+            if hasattr(camera_optimizer, "get_metrics_dict"):
+                camera_optimizer.get_metrics_dict(metrics_dict)
+            for k, v in metrics_dict.items():
+                self.writer.add_scalar(f"train/{k}", v, step)
+                
+            # Monitor pose learning rate
+            if len(schedulers) > 1 and schedulers[1] is not None:
+                 self.writer.add_scalar("train/poseLR", schedulers[1].get_last_lr()[0], step)
+
+            if cfg.depth_loss:
+                self.writer.add_scalar("train/depthloss", loss_items.get('depthloss', 0.0), step)
+            if cfg.enable_depth_smooth_loss and loss_items.get('depth_smooth_loss', 0.0) > 0:
+                self.writer.add_scalar("train/depth_smooth_loss", loss_items['depth_smooth_loss'], step)
+            if cfg.use_bilateral_grid:
+                self.writer.add_scalar("train/tvloss", loss_items.get('tvloss', 0.0), step)
+
+            self.writer.flush()
+        
+        # Checkpointing
+        if step in [i - 1 for i in cfg.save_steps] or step == max_steps - 1:
+            mem = torch.cuda.max_memory_allocated() / 1024**3
+            stats = {
+                "mem": mem,
+                "num_GS": len(self.splats["means"]),
+            }
+            print("Step: ", step, stats)
+            with open(f"{self.stats_dir}/train_step{step:04d}_rank{self.world_rank}.json", "w") as f:
+                json.dump(stats, f)
+            
+            data = {"step": step, "splats": self.splats.state_dict()}
+            if self.world_size > 1:
+                data["camera_opt"] = self.camera_optimizer.module.state_dict()
+            else:
+                data["camera_opt"] = self.camera_optimizer.state_dict()
+            
+            if cfg.app_opt:
+                if self.world_size > 1:
+                    data["app_module"] = self.app_module.module.state_dict()
+                else:
+                    data["app_module"] = self.app_module.state_dict()
+            
+            torch.save(data, f"{self.ckpt_dir}/ckpt_{step}_rank{self.world_rank}.pt")
+        
+        # Save PLY
+        if (step in [i - 1 for i in cfg.ply_steps] or step == max_steps - 1) and cfg.save_ply:
+            self.save_gsply(step)
+
     def train(self):
         """
         Main training loop.
-        
-        Workflow:
-        1. Setup configuration and directories.
-        2. Initialize data loaders and schedulers.
-        3. Pre-training tasks (allocate buffers, initial renders).
-        4. Loop over steps:
-           a. Fetch data batch.
-           b. Optimize camera poses.
-           c. Rasterize 3D Gaussians.
-           d. Compute losses (RGB, Depth, Regularization).
-           e. Compute Virtual View Loss (DiFix3D).
-           f. Backward pass and optimization step.
-           g. Logging and Checkpointing.
+        Refactored for clarity and modularity.
         """
         cfg = self.cfg
         device = self.device
         world_rank = self.world_rank
-        world_size = self.world_size
 
         self._save_config()
         max_steps = cfg.max_steps
@@ -744,241 +856,67 @@ class DeblurDiFix3DRunner(Runner):
         # Training loop.
         global_tic = time.time()
         pbar = tqdm.tqdm(range(init_step, max_steps))
+        
         for step in pbar:
+            # 1. Viewer Handling
             if not cfg.disable_viewer:
                 while self.viewer.state.status == "paused":
                     time.sleep(0.01)
                 self.viewer.lock.acquire()
                 tic = time.time()
 
+            # 2. Data Loading
             try:
                 data = next(trainloader_iter)
             except StopIteration:
                 trainloader_iter = iter(trainloader)
                 data = next(trainloader_iter)
                 
-            camtoworlds = camtoworlds_gt = data["camtoworld"].to(device, non_blocking=True)  # [1, 4, 4]
-            Ks = data["K"].to(device, non_blocking=True)  # [1, 3, 3]
-            pixels = data["image"].to(device, non_blocking=True) / 255.0  # [1, H, W, 3]
-            
-            num_train_rays_per_step = pixels.shape[0] * pixels.shape[1] * pixels.shape[2]
+            camtoworlds = data["camtoworld"].to(device, non_blocking=True)
+            Ks = data["K"].to(device, non_blocking=True)
+            pixels = data["image"].to(device, non_blocking=True) / 255.0
             image_ids = data["image_id"].to(device, non_blocking=True)
-            if cfg.depth_loss and data["depth"] is not None:
-                depths_gt = data["depth"].to(device, non_blocking=True) # [1, H, W, 1]
-
-            height, width = pixels.shape[1:3]
-
-            assert camtoworlds.shape[0] == 1
-            camera_optimizer = self.camera_optimizer.module if hasattr(self.camera_optimizer, 'module') else self.camera_optimizer
             
-            if isinstance(camera_optimizer, CameraOptModule):
-                camtoworlds = camera_optimizer(camtoworlds, image_ids)
-            else:
-                camtoworlds = camera_optimizer.apply_to_cameras(camtoworlds, image_ids, "uniform")[0]
+            # 3. Camera Optimization
+            camtoworlds, Ks = self._optimize_cameras(camtoworlds, Ks, image_ids)
             
-            assert camtoworlds.shape[0] == cfg.camera_optimizer.num_virtual_views
-            Ks = Ks.tile((camtoworlds.shape[0], 1, 1))
-            
-            #  Disabled BAD-Gaussians virtual camera collection; keep DiFix3D only
-            # if step % 1000 == 0:  # 每1000步收集一次，避免数据过多
-            #     self.collect_virtual_camera_data(camera_poses=camtoworlds, step=step, source="BAD-Gaussians")
-
-            
+            # 4. Rasterization
             sh_degree_to_use = min(step // cfg.sh_degree_interval, cfg.sh_degree)
-
+            width, height = pixels.shape[2], pixels.shape[1]
+            
             renders, alphas, info = self.rasterize_splats(
-                camtoworlds=camtoworlds,
-                Ks=Ks,
-                width=width,
-                height=height,
-                sh_degree=sh_degree_to_use,
-                near_plane=cfg.near_plane,
-                far_plane=cfg.far_plane,
+                camtoworlds=camtoworlds, Ks=Ks, width=width, height=height,
+                sh_degree=sh_degree_to_use, near_plane=cfg.near_plane, far_plane=cfg.far_plane,
                 image_ids=image_ids,
                 render_mode="RGB+ED" if (cfg.depth_loss or cfg.enable_depth_smooth_loss) else "RGB",
             )
             
-            if renders.shape[-1] == 4:
-                colors, depths = renders[..., 0:3], renders[..., 3:4]
-            else:
-                colors, depths = renders, None
+            colors, depths = (renders[..., 0:3], renders[..., 3:4]) if renders.shape[-1] == 4 else (renders, None)
 
-            bkgd = torch.rand(1, 3, device=device) if cfg.random_bkgd else torch.zeros(1, 3, device=device)
+            # 5. Loss Computation
+            # Background
             if cfg.random_bkgd:
+                bkgd = torch.rand(1, 3, device=device)
                 colors = colors + bkgd * (1.0 - alphas)
-            
-            
-            depth_smooth_loss_value = 0.0
-
-            # BAD-Gaussians: average the virtual views
-            colors = colors.mean(0)[None]
-            
-
-            # Virtual View Loss (DiFix3D)
-            virtual_view_loss_to_add = self._compute_virtual_view_loss(step, bkgd, sh_degree_to_use)
-
-            if False: # Removed old logic
-                 virtual_view_loss_to_add_old = 0.0
-
-            print(f" Check hybrid sampling: step={step}, virtual_view_start_step={cfg.virtual_view_start_step}, enable_difix3d={cfg.enable_difix3d}, difix3d_processor={self.difix3d_processor is not None}, step%interval={step % cfg.virtual_view_interval}")
-            if False and step >= cfg.virtual_view_start_step and cfg.enable_difix3d and self.difix3d_processor is not None and step % cfg.virtual_view_interval == 0:
-                if step == cfg.virtual_view_start_step:
-                    print(f" Step {step}: first enable hybrid-sampling virtual view training")
-                else:
-                    print(f" Step {step}: continue hybrid-sampling virtual view training")
-                
-                enhanced_samples = self.difix3d_processor.process_virtual_views_batch(
-                    trainset=self.trainset,
-                    camera_optimizer=self.camera_optimizer,
-                    rasterize_splats_fn=self.rasterize_splats,
-                    cfg=cfg,
-                    step=step,
-                    save_comparisons=cfg.difix3d_save_comparisons,
-                    comparison_dir=self.difix3d_comparison_dir
-                )
-                
-                if enhanced_samples:
-
-                    if not hasattr(self, 'enhanced_data'):
-                        self.enhanced_data = []
-                    elif not isinstance(self.enhanced_data, list):
-                        self.enhanced_data = []  # reset to list
-                    
-                    # Add new samples with total limit
-                    max_samples = getattr(cfg, 'difix3d_max_augmented_samples', 100)
-                    for enhanced_sample in enhanced_samples:
-                        # Limit enhanced data count; keep latest samples
-                        if len(self.enhanced_data) >= max_samples:
-                            self.enhanced_data.pop(0)  # remove oldest sample
-                        
-                        self.enhanced_data.append(enhanced_sample)
-                    
-                    self.collect_virtual_camera_data(enhanced_samples=enhanced_samples, source="DiFix3D-Progressive")
-                    
-                    print(f"Progressive interpolation done:")
-                    print(f"   Generated samples this round: {len(enhanced_samples)}")
-                    print(f"   Total enhanced samples now: {len(self.enhanced_data)}")
-                    print(f"    Current virtual camera batch count: {len(self.virtual_camera_batches)}")
-                    total_virtual_cameras = sum(len(batch) for batch in self.virtual_camera_batches)
-                    print(f"   Current total virtual cameras: {total_virtual_cameras}")
-                    for i, sample in enumerate(enhanced_samples):
-                        quality_score = sample.get('quality_score', 'N/A')
-                        if isinstance(quality_score, (int, float)):
-                            print(f"   Sample {i}: image_id={sample['image_id'].item()}, quality_score={quality_score:.4f}")
-                        else:
-                            print(f"   Sample {i}: image_id={sample['image_id'].item()}, quality_score={quality_score}")
-                else:
-                    print(" Progressive interpolation failed; no new samples")
-                    
-            #  After virtual view start step: compute virtual view loss
-            if step >= cfg.virtual_view_start_step and hasattr(self, 'enhanced_data'):
-                #  Randomly choose one enhanced sample for loss (reduce cost)
-                if isinstance(self.enhanced_data, list) and len(self.enhanced_data) > 0:
-                    # Randomly pick a sample
-                    import random
-                    sample = random.choice(self.enhanced_data)
-                    
-                    loss_virtual_sample = 0.0
-                    
-                    #  Key: re-render virtual view to connect gradients to current 3D GS
-                    virtual_pose = sample["pose"].unsqueeze(0).to(device)  # [1, 4, 4]
-                    virtual_K = sample["K"].unsqueeze(0).to(device)  # [1, 3, 3]
-                    virtual_image_id = sample["image_id"].unsqueeze(0).to(device)
-                    virtual_width = sample["width"]
-                    virtual_height = sample["height"]
-                    
-                    # Re-render virtual view (with gradients connected to current 3D GS)
-                    renders_virtual, alphas_virtual, info_virtual = self.rasterize_splats(
-                        camtoworlds=virtual_pose,
-                        Ks=virtual_K,
-                        width=virtual_width,
-                        height=virtual_height,
-                        sh_degree=sh_degree_to_use,
-                        near_plane=cfg.near_plane,
-                        far_plane=cfg.far_plane,
-                        image_ids=virtual_image_id,
-                        render_mode="RGB+ED" if cfg.enable_depth_smooth_loss else "RGB",
-                    )
-                    
-                    # Extract RGB and depth
-                    if renders_virtual.shape[-1] == 4:
-                        colors_virtual, depths_virtual = renders_virtual[..., 0:3], renders_virtual[..., 3:4]
-                    else:
-                        colors_virtual, depths_virtual = renders_virtual, None
-                    
-                    # Apply random background (if enabled)
-                    if cfg.random_bkgd:
-                        colors_virtual = colors_virtual + bkgd * (1.0 - alphas_virtual)
-                    
-                    # Use DiFix-enhanced image as supervision (no gradient)
-                    enhanced_image = sample["enhanced_image"].to(device)  # [H, W, 3]
-                    if enhanced_image.dim() == 3:
-                        enhanced_image = enhanced_image.unsqueeze(0)  # [1, H, W, 3]
-                    
-                    # Compute DiFix distillation loss: distill enhanced image into render
-                    difix_distillation_loss = 0.0
-                    if cfg.enable_difix_enhancement_loss:
-                        # L1 loss
-                        difix_l1_loss = F.l1_loss(colors_virtual, enhanced_image)
-                        
-                        # SSIM loss
-                        difix_ssim_loss = 1.0 - self.ssim(
-                            colors_virtual.permute(0, 3, 1, 2), 
-                            enhanced_image.permute(0, 3, 1, 2)
-                        )
-                        
-                        # DISTS perceptual loss
-                        difix_dists_loss = self.dists_loss(colors_virtual, enhanced_image)
-                        difix_perc_loss = self.perceptual_loss(colors_virtual, enhanced_image)
-                        # Combined distillation loss
-                        difix_distillation_loss = (
-                            difix_l1_loss * cfg.difix_enhancement_l1_weight +
-                            difix_dists_loss * 0.01
-                        )
-                        
-                        loss_virtual_sample += difix_distillation_loss
-                    
-                    # Depth smooth loss (if enabled)
-                    if cfg.enable_depth_smooth_loss and depths_virtual is not None:
-                        depth_smooth_loss_virtual = depth_smooth_loss_4neighbor(depths_virtual)
-                        loss_virtual_sample += depth_smooth_loss_virtual * cfg.depth_smooth_lambda
-                    
-                    # Apply weight
-                    virtual_view_loss_to_add = cfg.virtual_view_loss_weight * loss_virtual_sample
-                    
-                    # Add debug info
-                    if step % 100 == 0:  # 每100步打印一次详细信息
-                        print(f" Virtual view loss debug (step {step}):")
-                        print(f"   Available sample count: {len(self.enhanced_data)}")
-                        print(f"   Current sample ID: {sample.get('image_id', 'unknown')}")
-                        print(f"   Current sample quality score: {sample.get('quality_score', 'N/A'):.4f}")
-                        print(f"   Virtual loss: {loss_virtual_sample:.6f}")
-                        print(f"   Weighted loss: {virtual_view_loss_to_add:.6f}")
-                        print(f"   Weight: {cfg.virtual_view_loss_weight}")
-                        if cfg.enable_depth_smooth_loss:
-                            print(f"    Depth smooth loss enabled, weight: {cfg.depth_smooth_lambda}")
             else:
-                # Before start step, virtual view loss is 0
-                virtual_view_loss_to_add = 0.0
-                
+                bkgd = torch.zeros(1, 3, device=device)
+
+            # Bilateral Grid
             if cfg.use_bilateral_grid:
                 grid_y, grid_x = torch.meshgrid(
-                    (torch.arange(height, device=self.device) + 0.5) / height,
-                    (torch.arange(width, device=self.device) + 0.5) / width,
+                    (torch.arange(height, device=device) + 0.5) / height,
+                    (torch.arange(width, device=device) + 0.5) / width,
                     indexing="ij",
                 )
                 grid_xy = torch.stack([grid_x, grid_y], dim=-1).unsqueeze(0)
                 colors = slice(self.bil_grids, grid_xy, colors, image_ids)["rgb"]
 
             self.cfg.strategy.step_pre_backward(
-                params=self.splats,
-                optimizers=self.optimizers,
-                state=self.strategy_state,
-                step=step,
-                info=info,
+                params=self.splats, optimizers=self.optimizers, state=self.strategy_state,
+                step=step, info=info,
             )
 
-            # loss
+            # Main Losses
             l1loss = F.l1_loss(colors, pixels)
             if self.cfg.fused_ssim:
                 ssimloss = 1.0 - self.ssim(colors.permute(0, 3, 1, 2), pixels.permute(0, 3, 1, 2), padding="valid")
@@ -986,224 +924,109 @@ class DeblurDiFix3DRunner(Runner):
                 ssimloss = 1.0 - self.ssim(pixels.permute(0, 3, 1, 2), colors.permute(0, 3, 1, 2))
             loss = l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda
             
-            # [Modified] Dense Depth Loss
+            # Optional Losses
+            loss_items = {'loss': loss.item(), 'l1loss': l1loss.item(), 'ssimloss': ssimloss.item()}
+            
             if cfg.depth_loss and data["depth"] is not None:
+                depthloss = self._compute_depth_loss(depths, data["depth"].to(device))
+                loss += depthloss
+                loss_items['depthloss'] = depthloss.item()
                 
-                # Ensure (B, H, W, 1)
-                if depths_gt.ndim == 3: depths_gt = depths_gt.unsqueeze(-1)
-
-                # Dense mask
-                valid_mask = (depths_gt > 0).float()
-                
-                # Disparity Space Loss
-                disp = torch.zeros_like(depths)
-                disp_mask = (depths > 0)
-                disp[disp_mask] = 1.0 / (depths[disp_mask] + 1e-6)
-
-                disp_gt = torch.zeros_like(depths_gt)
-                gt_mask = depths_gt > 0
-                disp_gt[gt_mask] = 1.0 / (depths_gt[gt_mask] + 1e-6)
-                
-                depthloss = F.l1_loss(disp * valid_mask, disp_gt * valid_mask, reduction='sum')
-                num_valid = valid_mask.sum()
-                if num_valid > 0:
-                    depthloss = depthloss / num_valid
-                    loss += depthloss * cfg.depth_lambda * self.scene_scale
-
             if cfg.use_bilateral_grid:
                 tvloss = 10 * total_variation_loss(self.bil_grids.grids)
                 loss += tvloss
+                loss_items['tvloss'] = tvloss.item()
 
             if cfg.enable_mcmc_opacity_reg:
-                loss = loss + cfg.opacity_reg * torch.abs(torch.sigmoid(self.splats["opacities"])).mean()
-
+                loss += cfg.opacity_reg * torch.abs(torch.sigmoid(self.splats["opacities"])).mean()
             if cfg.enable_mcmc_scale_reg:
-                loss = loss + cfg.scale_reg * torch.abs(torch.exp(self.splats["scales"])).mean()
-
+                loss += cfg.scale_reg * torch.abs(torch.exp(self.splats["scales"])).mean()
             if cfg.enable_phys_scale_reg and step % 10 == 0:
                 scale_exp = torch.exp(self.splats["scales"])
-                scale_reg = (
-                    torch.maximum(
-                        scale_exp.amax(dim=-1) / scale_exp.amin(dim=-1),
-                        torch.tensor(cfg.max_gauss_ratio),
-                    )
-                    - cfg.max_gauss_ratio
-                )
-                scale_reg = 0.1 * scale_reg.mean()
-                loss += scale_reg
+                scale_reg = (torch.maximum(scale_exp.amax(dim=-1) / scale_exp.amin(dim=-1), torch.tensor(cfg.max_gauss_ratio)) - cfg.max_gauss_ratio)
+                loss += 0.1 * scale_reg.mean()
 
-            #  Add depth smooth loss
             if cfg.enable_depth_smooth_loss and step >= 25000 and depths is not None:
-                depth_smooth_loss_value = depth_smooth_loss_4neighbor(depths)
-                loss += depth_smooth_loss_value * cfg.depth_smooth_lambda
-                if step % 100 == 0:  # print every 100 steps
-                    print(f"🔍 Depth smooth loss weight: {cfg.depth_smooth_lambda}, weighted: {depth_smooth_loss_value * cfg.depth_smooth_lambda:.6f}")
+                depth_smooth_val = depth_smooth_loss_4neighbor(depths)
+                loss += depth_smooth_val * cfg.depth_smooth_lambda
+                loss_items['depth_smooth_loss'] = depth_smooth_val.item()
 
-            #  Critical: add virtual view loss after all other losses
-            loss += virtual_view_loss_to_add
+            # Virtual View Loss (DiFix3D)
+            virtual_view_loss = self._compute_virtual_view_loss(step, bkgd, sh_degree_to_use)
+            loss += virtual_view_loss
             
-            # If virtual view training enabled, print total loss info
-            if virtual_view_loss_to_add > 0:
-                print(f" Final Loss: base={loss.item() - virtual_view_loss_to_add:.4f}, virtual={virtual_view_loss_to_add:.4f}, total={loss.item():.4f}")
-
-            loss.backward()
-
-            desc = f"loss={loss.item():.3f}| " f"sh degree={sh_degree_to_use}| "
-            if cfg.depth_loss:
-                desc += f"depth loss={depthloss.item():.6f}| "
-            if cfg.enable_depth_smooth_loss and depth_smooth_loss_value > 0:
-                desc += f"depth smooth={depth_smooth_loss_value.item():.6f}| "
+            # 6. Optimization Step
+            self._optimization_step(step, loss, info, schedulers, Ks)
+            loss_items['loss'] = loss.item() # Update with final loss
+            
+            # 7. Logging & Checkpoint
+            if self.world_rank == 0:
+                self._log_and_checkpoint(step, max_steps, loss_items, schedulers)
+            
+            # Progress bar
+            desc = f"loss={loss.item():.3f}| sh degree={sh_degree_to_use}| "
             pbar.set_description(desc)
 
-            # write images (gt and render)
-            # if world_rank == 0 and step % 800 == 0:
-            #     canvas = torch.cat([pixels, colors], dim=2).detach().cpu().numpy()
-            #     canvas = canvas.reshape(-1, *canvas.shape[2:])
-            #     imageio.imwrite(
-            #         f"{self.render_dir}/train_rank{self.world_rank}.png",
-            #         (canvas * 255).astype(np.uint8),
-            #     )
-
-            if world_rank == 0 and cfg.tb_every > 0 and step % cfg.tb_every == 0:
-                mem = torch.cuda.max_memory_allocated() / 1024**3
-                self.writer.add_scalar("train/loss", loss.item(), step)
-                self.writer.add_scalar("train/l1loss", l1loss.item(), step)
-                self.writer.add_scalar("train/ssimloss", ssimloss.item(), step)
-                self.writer.add_scalar("train/num_GS", len(self.splats["means"]), step)
-                self.writer.add_scalar("train/mem", mem, step)
-
-                # monitor camera pose optimization
-                metrics_dict = {}
-                # Handle DDP-wrapped module
-                camera_optimizer = self.camera_optimizer.module if hasattr(self.camera_optimizer, 'module') else self.camera_optimizer
-                if hasattr(camera_optimizer, "get_metrics_dict"):
-                    camera_optimizer.get_metrics_dict(metrics_dict)
-                for k, v in metrics_dict.items():
-                    self.writer.add_scalar(f"train/{k}", v, step)
-
-                # monitor pose learning rate
-                self.writer.add_scalar("train/poseLR", pose_scheduler.get_last_lr()[0], step)
-
-                # monitor ATE
-                #     self.visualize_traj(step)
-
-                if cfg.depth_loss:
-                    self.writer.add_scalar("train/depthloss", depthloss.item(), step)
-                if cfg.enable_depth_smooth_loss and depth_smooth_loss_value > 0:
-                    self.writer.add_scalar("train/depth_smooth_loss", depth_smooth_loss_value.item(), step)
-                if cfg.use_bilateral_grid:
-                    self.writer.add_scalar("train/tvloss", tvloss.item(), step)
-                if cfg.tb_save_image:
-                    canvas = torch.cat([pixels, colors], dim=2).detach().cpu().numpy()
-                    canvas = canvas.reshape(-1, *canvas.shape[2:])
-                    self.writer.add_image("train/render", canvas, step)
-                self.writer.flush()
-
-            # save checkpoint before updating the model
-            if step in [i - 1 for i in cfg.save_steps] or step == max_steps - 1:
-                mem = torch.cuda.max_memory_allocated() / 1024**3
-                stats = {
-                    "mem": mem,
-                    "ellipse_time": time.time() - global_tic,
-                    "num_GS": len(self.splats["means"]),
-                }
-                print("Step: ", step, stats)
-                with open(
-                    f"{self.stats_dir}/train_step{step:04d}_rank{self.world_rank}.json",
-                    "w",
-                ) as f:
-                    json.dump(stats, f)
-                data = {"step": step, "splats": self.splats.state_dict()}
-                if world_size > 1:
-                    data["camera_opt"] = self.camera_optimizer.module.state_dict()
-                else:
-                    data["camera_opt"] = self.camera_optimizer.state_dict()
-                if cfg.app_opt:
-                    if world_size > 1:
-                        data["app_module"] = self.app_module.module.state_dict()
-                    else:
-                        data["app_module"] = self.app_module.state_dict()
-                torch.save(data, f"{self.ckpt_dir}/ckpt_{step}_rank{self.world_rank}.pt")
-
-            if (step in [i - 1 for i in cfg.ply_steps] or step == max_steps - 1) and cfg.save_ply:
-                self.save_gsply(step)
-
-            if isinstance(self.cfg.strategy, DefaultStrategy):
-                self.cfg.strategy.step_post_backward(
-                    params=self.splats,
-                    optimizers=self.optimizers,
-                    state=self.strategy_state,
-                    step=step,
-                    info=info,
-                    packed=cfg.packed,
-                )
-            elif isinstance(self.cfg.strategy, MCMCStrategy):
-                self.cfg.strategy.step_post_backward(
-                    params=self.splats,
-                    optimizers=self.optimizers,
-                    state=self.strategy_state,
-                    step=step,
-                    info=info,
-                    lr=schedulers[0].get_last_lr()[0],
-                )
-            else:
-                assert_never(self.cfg.strategy)
-
-            # Turn Gradients into Sparse Tensor before running optimizer
-            if cfg.sparse_grad:
-                assert cfg.packed, "Sparse gradients only work with packed mode."
-                gaussian_ids = info["gaussian_ids"]
-                for k in self.splats.keys():
-                    grad = self.splats[k].grad
-                    if grad is None or grad.is_sparse:
-                        continue
-                    self.splats[k].grad = torch.sparse_coo_tensor(
-                        indices=gaussian_ids[None],  # [1, nnz]
-                        values=grad[gaussian_ids],  # [nnz, ...]
-                        size=self.splats[k].size(),  # [N, ...]
-                        is_coalesced=len(Ks) == 1,
-                    )
-
-            # optimize
-            for optimizer in self.optimizers.values():
-                optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
-            for optimizer in self.pose_optimizers:
-                if step % cfg.pose_gradient_accumulation_steps == cfg.pose_gradient_accumulation_steps - 1:
-                    optimizer.step()
-                if step % cfg.pose_gradient_accumulation_steps == 0:
-                    optimizer.zero_grad(set_to_none=True)
-            for optimizer in self.app_optimizers:
-                optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
-            for optimizer in self.bil_grid_optimizers:
-                optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
-            for scheduler in schedulers:
-                scheduler.step()
-
-            # eval the full set
+            # 8. Evaluation & Viz
             if step in [i - 1 for i in cfg.eval_steps]:
-                if cfg.deblur_eval_enable_during_training and self.testset is not None:
-                    if cfg.deblur_eval_enable_pose_opt:
-                        self.eval_with_pose_opt(step, "deblur", self.testset)
-                    else:
-                        self.eval_deblur(step, "deblur", self.testset)
-                if cfg.nvs_eval_enable_during_training and self.valset is not None:
-                    self.eval_with_pose_opt(step, "nvs", self.valset)
-                self.render_traj(step)
+                self._run_evaluation(step)
 
+            # 9. Viewer Update
             if not cfg.disable_viewer:
                 self.viewer.lock.release()
-                num_train_steps_per_sec = 1.0 / (time.time() - tic)
-                num_train_rays_per_sec = num_train_rays_per_step * num_train_steps_per_sec
-                # Update the viewer state.
-                self.viewer.state.num_train_rays_per_sec = num_train_rays_per_sec
-                # Update the scene.
+                num_train_rays_per_step = pixels.shape[0] * pixels.shape[1] * pixels.shape[2]
+                self.viewer.state.num_train_rays_per_sec = num_train_rays_per_step / (time.time() - tic)
                 self.viewer.update(step, num_train_rays_per_step)
 
+    def _optimize_cameras(self, camtoworlds, Ks, image_ids):
+        """Handle camera pose optimization logic."""
+        cfg = self.cfg
         
-        if world_rank == 0:
+        # Apply camera optimizer
+        camera_optimizer = self.camera_optimizer.module if hasattr(self.camera_optimizer, 'module') else self.camera_optimizer
+        if isinstance(camera_optimizer, CameraOptModule):
+            camtoworlds = camera_optimizer(camtoworlds, image_ids)
+        else:
+            camtoworlds = camera_optimizer.apply_to_cameras(camtoworlds, image_ids, "uniform")[0]
+            
+        assert camtoworlds.shape[0] == cfg.camera_optimizer.num_virtual_views
+        Ks = Ks.tile((camtoworlds.shape[0], 1, 1))
+        return camtoworlds, Ks
+
+    def _compute_depth_loss(self, depths, depths_gt):
+        """Compute dense depth loss."""
+        if depths_gt.ndim == 3: depths_gt = depths_gt.unsqueeze(-1)
+        valid_mask = (depths_gt > 0).float()
+        
+        disp = torch.zeros_like(depths)
+        disp_mask = (depths > 0)
+        disp[disp_mask] = 1.0 / (depths[disp_mask] + 1e-6)
+
+        disp_gt = torch.zeros_like(depths_gt)
+        gt_mask = depths_gt > 0
+        disp_gt[gt_mask] = 1.0 / (depths_gt[gt_mask] + 1e-6)
+        
+        depthloss = F.l1_loss(disp * valid_mask, disp_gt * valid_mask, reduction='sum')
+        num_valid = valid_mask.sum()
+        if num_valid > 0:
+            depthloss = depthloss / num_valid
+            return depthloss * self.cfg.depth_lambda * self.scene_scale
+        return torch.tensor(0.0, device=self.device)
+
+    def _run_evaluation(self, step):
+        """Run evaluation tasks."""
+        cfg = self.cfg
+        if cfg.deblur_eval_enable_during_training and self.testset is not None:
+            if cfg.deblur_eval_enable_pose_opt:
+                self.eval_with_pose_opt(step, "deblur", self.testset)
+            else:
+                self.eval_deblur(step, "deblur", self.testset)
+        if cfg.nvs_eval_enable_during_training and self.valset is not None:
+             self.eval_with_pose_opt(step, "nvs", self.valset)
+        self.render_traj(step)
+
+        
+        if self.world_rank == 0:
             total_virtual_cameras = sum(len(batch) for batch in self.virtual_camera_batches)
             total_cameras = (len(self.all_train_cameras) if self.all_train_cameras is not None else 0) + total_virtual_cameras
             
