@@ -1,8 +1,9 @@
+
+
 import json
 import math
 import os
 import time
-import yaml
 import yaml
 from collections import defaultdict
 from pathlib import Path
@@ -59,7 +60,7 @@ from utils import (
 from pection_loss import VGG16PerceptualLoss, VGG16PerceptualLossWithMultipleLayers, VGG16DISTSLoss
 
 from PIL import Image
-from difix3d_processor import DiFix3DProcessor
+from pipeline_difix import DifixPipeline
     
 
 @dataclass
@@ -241,7 +242,6 @@ class DeblurDiFix3DConfig(Config):
 
 
 def depth_smooth_loss_4neighbor(depth_map: torch.Tensor) -> torch.Tensor:
-    """Computes the smoothness loss for a depth map using L2 norm of gradients."""
     # Ensure input format is [B, H, W]
     if depth_map.dim() == 4:
         depth_map = depth_map.squeeze(-1)  # [B, H, W, 1] -> [B, H, W]
@@ -249,13 +249,26 @@ def depth_smooth_loss_4neighbor(depth_map: torch.Tensor) -> torch.Tensor:
     if depth_map.dim() != 3:
         raise ValueError(f"Depth map must be 3D [B, H, W], got: {depth_map.shape}")
     
-    # Compute gradients using torch.diff for better readability and performance
-    diff_h = torch.diff(depth_map, dim=2)  # [B, H, W-1]
-    diff_v = torch.diff(depth_map, dim=1)  # [B, H-1, W]
+    batch_size, height, width = depth_map.shape
     
-    # Total smoothness loss (L2)
-    return diff_h.pow(2).mean() + diff_v.pow(2).mean()
+    # Compute horizontal and vertical differences
+    # Horizontal diff: depth[i, j] - depth[i, j-1] (except left boundary)
+    diff_h = depth_map[:, :, 1:] - depth_map[:, :, :-1]  # [B, H, W-1]
+    
+    # Vertical diff: depth[i, j] - depth[i-1, j] (except top boundary)
+    diff_v = depth_map[:, 1:, :] - depth_map[:, :-1, :]  # [B, H-1, W]
+    
+    # L2 loss
+    smooth_loss_h = torch.mean(diff_h ** 2)  # horizontal smoothness
+    smooth_loss_v = torch.mean(diff_v ** 2)  # vertical smoothness
+    
+    # Total smoothness loss
+    total_smooth_loss = smooth_loss_h + smooth_loss_v
+    
+    return total_smooth_loss
 
+
+    
 
 class DeblurDiFix3DRunner(Runner):
     """BAD-Gaussians deblurring + DiFix3D training engine"""
@@ -269,40 +282,8 @@ class DeblurDiFix3DRunner(Runner):
         self.world_size = world_size
         self.device = f"cuda:{local_rank}"
 
-        self._init_directories()
-
-        self._init_dataset()
-
-        self._init_difix3d()
-
-        self._init_gaussians()
-
-        self._init_optimizers()
-
-        self._init_metrics()
-
-        self._init_viewer()
-
-        self.cfg_to_save = cfg
-        
-        # Store virtual camera batches
-        self.virtual_camera_batches = []
-        # Store all training camera positions
-        self.all_train_cameras = None
-        
-        # Store virtual view quality scores
-        self.virtual_view_scores = []
-        # Store baseline score data (training PSNR baseline)
-        self.baseline_scores = {}
-        
-        # Initialize hybrid sampling strategy (on-demand interpolation)
-        # Track hybrid sampling state
-        self.hybrid_sampling_initialized = False
-
-    def _init_directories(self):
-        """Initialize all output directories."""
-        cfg = self.cfg
-        self.result_dir = cfg.result_dir
+        # Set output directories
+        self.result_dir = cfg.result_dir  # preserve original path
         os.makedirs(cfg.result_dir, exist_ok=True)
         self.ckpt_dir = f"{cfg.result_dir}/ckpts"
         os.makedirs(self.ckpt_dir, exist_ok=True)
@@ -312,34 +293,57 @@ class DeblurDiFix3DRunner(Runner):
         os.makedirs(self.render_dir, exist_ok=True)
         self.ply_dir = f"{cfg.result_dir}/ply"
         os.makedirs(self.ply_dir, exist_ok=True)
+        # DiFix3D comparison directory
         self.difix3d_comparison_dir = f"{cfg.result_dir}/difix3d_comparisons"
         os.makedirs(self.difix3d_comparison_dir, exist_ok=True)
+
+        # Tensorboard
         self.writer = SummaryWriter(log_dir=f"{cfg.result_dir}/tb")
 
-    def _init_dataset(self):
-        """Initialize dataset and related components."""
-        cfg = self.cfg
+        # Extract scene_name
         self.scene_name = Path(cfg.data_dir).name
         print(f" Scene name: {self.scene_name}")
+        # self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
         self.scene_scale = cfg.global_scale
 
+        # load dataset using ColmapParser
         self.parser = ColmapParser(
             data_dir=cfg.data_dir,
-            factor=cfg.data_factor,
+            factor=cfg.data_factor,  # force using original images, no downsampling
             normalize=True,
             scale_factor=cfg.scale_factor,
-            downscale_rounding_mode="round",
-            adjust_scene=(cfg.init_type != "gsply"),
+            # Force disabling automatic downsampling
+            downscale_rounding_mode="round",  # use round instead of floor
+            adjust_scene=(cfg.init_type!="gsply"),
         )
+        # Training indices config: pass CLI/config train_indices to parser
         self.parser.train_indices = cfg.train_indices
         if cfg.train_indices is not None:
             print(f"[Dataset] Using configured training indices: {cfg.train_indices}")
         
-        # Debug checks
+        # Debug: check ColmapParser config
         print(f" ColmapParser config check:")
         print(f"   data_factor: {cfg.data_factor}")
         print(f"   scale_factor: {cfg.scale_factor}")
+        print(f"   downscale_rounding_mode: {self.parser.downscale_rounding_mode}")
+        print(f"   parser.factor: {self.parser.factor}")
+        if hasattr(self.parser, '_downscale_factor'):
+            print(f"   parser._downscale_factor: {self.parser._downscale_factor}")
         
+        # Check image paths
+        print(f" Image path check:")
+        if hasattr(self.parser, 'image_paths') and len(self.parser.image_paths) > 0:
+            sample_path = Path(self.parser.image_paths[0])
+            print(f"   Sample image path: {sample_path}")
+            if sample_path.exists():
+                img = Image.open(sample_path)
+                print(f"   Sample image size: {img.size}")
+            else:
+                print(f"    Sample image path does not exist!")
+        else:
+            print(f"    No image paths found!")
+
+        # Initialize camera trajectory generator
         self.trainset = DeblurNerfDataset(self.parser, split="train")
         self.valset = DeblurNerfDataset(self.parser, split="val")
         self.testset = DeblurNerfDataset(self.parser, split="test")
@@ -347,12 +351,11 @@ class DeblurDiFix3DRunner(Runner):
         self.quality_scorer = VirtualViewQualityScorer(device=self.device)
         print(f" Virtual view quality scoring model initialized")
 
-    def _init_difix3d(self):
-        """Initialize DiFix3D processor."""
-        cfg = self.cfg
+        # Initialize DiFix3D processor if enabled
         if cfg.enable_difix3d:
             self.ref_image_dir = f"{cfg.data_dir}/ref_image"
             print(f" Reference image directory: {self.ref_image_dir}")
+
             print(" Initializing DiFix3D processor...")
             self.difix3d_processor = DiFix3DProcessor(
                 model_name=cfg.difix3d_model_name,
@@ -368,10 +371,10 @@ class DeblurDiFix3DRunner(Runner):
             self.difix3d_processor = None
             print(" DiFix3D features disabled")
 
-    def _init_gaussians(self):
-        """Initialize 3D Gaussian splats."""
-        cfg = self.cfg
-        feature_dim = cfg.app_embed_dim if cfg.app_opt else None
+        # Initialize 3D Gaussian points
+        feature_dim = None
+        if cfg.app_opt:
+            feature_dim = cfg.app_embed_dim
 
         self.splats, self.optimizers = create_splats_with_optimizers(
             self.parser,
@@ -386,8 +389,8 @@ class DeblurDiFix3DRunner(Runner):
             batch_size=cfg.batch_size,
             feature_dim=feature_dim,
             device=self.device,
-            world_rank=self.world_rank,
-            world_size=self.world_size,
+            world_rank=world_rank,
+            world_size=world_size,
             ply_path=cfg.init_ply_path,
         )
         print(len(self.splats["means"]))
@@ -402,51 +405,51 @@ class DeblurDiFix3DRunner(Runner):
         else:
             assert_never(self.cfg.strategy)
 
-    def _init_optimizers(self):
-        """Initialize optimizers for camera, appearance, and bilateral grid."""
-        cfg = self.cfg
-        
-        # Camera Optimizer
+        # Total camera count across train/val/test
         total_cameras = len(self.trainset) + (len(self.valset) if self.valset else 0) + (len(self.testset) if self.testset else 0)
         
-        if (cfg.camera_optimizer.mode == "off" and cfg.pose_opt):
+        # Check if we should fallback to standard CameraOptModule
+        if (self.cfg.camera_optimizer.mode == "off" and cfg.pose_opt):
             print("Switching to CameraOptModule for static pose optimization (mode=off, pose_opt=True)")
-            cfg.camera_optimizer.num_virtual_views = 1
+            # Force virtual views to 1 since we are doing static optimization
+            self.cfg.camera_optimizer.num_virtual_views = 1
             self.camera_optimizer = CameraOptModule(total_cameras).to(self.device)
             self.camera_optimizer.zero_init()
         else:
-            self.camera_optimizer = cfg.camera_optimizer.setup(
+            self.camera_optimizer: BadCameraOptimizer = self.cfg.camera_optimizer.setup(
                 num_cameras=total_cameras,
                 device=self.device,
             )
             
-        # Get params for camera optimizer
-        camera_opt_module = self.camera_optimizer.module if hasattr(self.camera_optimizer, 'module') else self.camera_optimizer
-        if isinstance(camera_opt_module, CameraOptModule):
-            camera_params = list(camera_opt_module.parameters())
+        camera_optimizer_param_groups = {}
+        # Handle DDP-wrapped module
+        camera_optimizer = self.camera_optimizer.module if hasattr(self.camera_optimizer, 'module') else self.camera_optimizer
+        
+        if isinstance(camera_optimizer, CameraOptModule):
+            params = list(camera_optimizer.parameters())
         else:
-            groups = {}
-            camera_opt_module.get_param_groups(groups)
-            camera_params = groups["camera_opt"]
+            camera_optimizer.get_param_groups(camera_optimizer_param_groups)
+            params = camera_optimizer_param_groups["camera_opt"]
         
         self.pose_optimizers = []
         if cfg.pose_opt:
             self.pose_optimizers = [
                 torch.optim.Adam(
-                    camera_params,
+                    params,
                     lr=cfg.pose_opt_lr * math.sqrt(cfg.batch_size),
                     weight_decay=cfg.pose_opt_reg,
                 )
             ]
 
-        if self.world_size > 1:
+        if world_size > 1:
             self.camera_optimizer = DDP(self.camera_optimizer)
 
-        # Appearance Optimizer
+        # Appearance optimizer
         self.app_optimizers = []
         if cfg.app_opt:
+            assert feature_dim is not None
             self.app_module = AppearanceOptModule(
-                len(self.trainset), cfg.app_embed_dim, cfg.app_embed_dim, cfg.sh_degree
+                len(self.trainset), feature_dim, cfg.app_embed_dim, cfg.sh_degree
             ).to(self.device)
             torch.nn.init.zeros_(self.app_module.color_head[-1].weight)
             torch.nn.init.zeros_(self.app_module.color_head[-1].bias)
@@ -460,10 +463,10 @@ class DeblurDiFix3DRunner(Runner):
                     lr=cfg.app_opt_lr * math.sqrt(cfg.batch_size),
                 ),
             ]
-            if self.world_size > 1:
+            if world_size > 1:
                 self.app_module = DDP(self.app_module)
 
-        # Bilateral Grid Optimizer
+        # Bilateral grid
         self.bil_grid_optimizers = []
         if cfg.use_bilateral_grid:
             self.bil_grids = BilateralGrid(
@@ -480,24 +483,48 @@ class DeblurDiFix3DRunner(Runner):
                 ),
             ]
 
-    def _init_metrics(self):
-        """Initialize evaluation metrics and losses."""
+        # Evaluation metrics
         self.psnr = PeakSignalNoiseRatio(data_range=1.0).to(self.device)
         self.ssim = StructuralSimilarityIndexMeasure(data_range=1.0).to(self.device)
         self.lpips = LearnedPerceptualImagePatchSimilarity(normalize=True).to(self.device)
-        self.perceptual_loss = VGG16PerceptualLoss(feature_layer='relu2_2', device=self.device, enable_timing=False)
-        self.dists_loss = VGG16DISTSLoss(device=self.device, enable_timing=False)
+        
+        # Initialize VGG perceptual loss models (pre-created to avoid repetition)
+        self.perceptual_loss = VGG16PerceptualLoss(
+            feature_layer='relu2_2',
+            device=self.device,
+            enable_timing=False
+        )
+        self.dists_loss = VGG16DISTSLoss(
+            device=self.device,
+            enable_timing=False
+        )
 
-    def _init_viewer(self):
-        """Initialize visualization server."""
-        if not self.cfg.disable_viewer:
+        # Initialize viewer
+        if not cfg.disable_viewer:
             import nerfview
-            self.server = viser.ViserServer(port=self.cfg.port, verbose=False)
+            self.server = viser.ViserServer(port=cfg.port, verbose=False)
             self.viewer = nerfview.Viewer(
                 server=self.server,
                 render_fn=self._viewer_render_fn,
                 mode="training",
             )
+
+        self.cfg_to_save = cfg
+        
+        # Store virtual camera batches
+        self.virtual_camera_batches = []
+        # Store all training camera positions
+        self.all_train_cameras = None
+        
+        # Store virtual view quality scores
+        self.virtual_view_scores = []
+        # Store baseline score data (training PSNR baseline)
+        self.baseline_scores = {}
+        
+        # Initialize hybrid sampling strategy (on-demand interpolation)
+        # Track hybrid sampling state
+        self.hybrid_sampling_initialized = False
+        
 
     def collect_train_camera_data(self):
         """
@@ -564,182 +591,74 @@ class DeblurDiFix3DRunner(Runner):
                     raise e
 
 
-    def _save_config(self):
-        """Save configuration to file."""
-        if self.world_rank == 0:
-            with open(f"{self.cfg.result_dir}/cfg.yml", "w") as f:
-                yaml.dump(vars(self.cfg), f)
-
-    def _create_schedulers(self):
-        """Create learning rate schedulers."""
+    def train(self):
+        """Main training loop - based on simple_trainer_deblur.py"""
         cfg = self.cfg
+        device = self.device
+        world_rank = self.world_rank
+        world_size = self.world_size
+
+        # Dump cfg.
+        if world_rank == 0:
+            with open(f"{cfg.result_dir}/cfg.yml", "w") as f:
+                yaml.dump(vars(cfg), f)
+
         max_steps = cfg.max_steps
-        
-        # Means scheduler
+        init_step = 0
+
         schedulers = [
+            # means has a learning rate schedule, that end at 0.01 of the initial value
             torch.optim.lr_scheduler.ExponentialLR(self.optimizers["means"], gamma=0.01 ** (1.0 / max_steps)),
         ]
         
-        # Pose scheduler
-        pose_scheduler = None
+        # pose optimization has a learning rate schedule
         if cfg.pose_opt:
             pose_scheduler = torch.optim.lr_scheduler.ExponentialLR(
                 self.pose_optimizers[0], gamma=cfg.pose_opt_lr_decay ** (1.0 / max_steps)
             )
             schedulers.append(pose_scheduler)
 
-        # Bilateral grid scheduler
         if cfg.use_bilateral_grid:
+            # bilateral grid has a learning rate schedule. Linear warmup for 1000 steps.
             schedulers.append(
-                torch.optim.lr_scheduler.ChainedScheduler([
-                    torch.optim.lr_scheduler.LinearLR(
-                        self.bil_grid_optimizers[0],
-                        start_factor=0.01,
-                        total_iters=1000,
-                    ),
-                    torch.optim.lr_scheduler.ExponentialLR(
-                        self.bil_grid_optimizers[0], gamma=0.01 ** (1.0 / max_steps)
-                    ),
-                ])
+                torch.optim.lr_scheduler.ChainedScheduler(
+                    [
+                        torch.optim.lr_scheduler.LinearLR(
+                            self.bil_grid_optimizers[0],
+                            start_factor=0.01,
+                            total_iters=1000,
+                        ),
+                        torch.optim.lr_scheduler.ExponentialLR(
+                            self.bil_grid_optimizers[0], gamma=0.01 ** (1.0 / max_steps)
+                        ),
+                    ]
+                )
             )
-        return schedulers, pose_scheduler
 
-    def _init_trainloader(self):
-        """Initialize data loader."""
-        return torch.utils.data.DataLoader(
+        trainloader = torch.utils.data.DataLoader(
             self.trainset,
-            batch_size=self.cfg.batch_size,
+            batch_size=cfg.batch_size,
             shuffle=True,
             num_workers=4,
             persistent_workers=True,
-            pin_memory=self.cfg.pin_memory,
+            pin_memory=cfg.pin_memory,
         )
-
-    def _pre_training_tasks(self):
-        """Perform tasks before training loop starts."""
-        if self.cfg.visualize_cameras:
-            self._init_viewer_state()
-
-        if self.world_rank == 0:
-            print("Start collecting training camera poses...")
-            self.collect_train_camera_data()
-            print("Saving initialization ply and rendering trajectory...")
-            if self.cfg.save_ply:
-                self.save_gsply(0)
-            self.render_traj(step=0)
-
-    def _compute_virtual_view_loss(self, step: int, bkgd: torch.Tensor, sh_degree_to_use: int):
-        """Compute loss from virtual views (DiFix3D)."""
-        cfg = self.cfg
-        loss_value = 0.0
-        
-        # 1. Generate/Collect Virtual Views
-        if step >= cfg.virtual_view_start_step and cfg.enable_difix3d and self.difix3d_processor is not None and step % cfg.virtual_view_interval == 0:
-            enhanced_samples = self.difix3d_processor.process_virtual_views_batch(
-                trainset=self.trainset,
-                camera_optimizer=self.camera_optimizer,
-                rasterize_splats_fn=self.rasterize_splats,
-                cfg=cfg,
-                step=step,
-                save_comparisons=cfg.difix3d_save_comparisons,
-                comparison_dir=self.difix3d_comparison_dir
-            )
-            
-            if enhanced_samples:
-                if not hasattr(self, 'enhanced_data') or not isinstance(self.enhanced_data, list):
-                    self.enhanced_data = []
-                
-                # Update sample buffer
-                max_samples = getattr(cfg, 'difix3d_max_augmented_samples', 100)
-                for enhanced_sample in enhanced_samples:
-                    if len(self.enhanced_data) >= max_samples:
-                        self.enhanced_data.pop(0)
-                    self.enhanced_data.append(enhanced_sample)
-                
-                self.collect_virtual_camera_data(enhanced_samples=enhanced_samples, source="DiFix3D-Progressive")
-                
-                # Simple progress log
-                if step % 1000 == 0:
-                    print(f"Progressive interpolation: {len(enhanced_samples)} new samples")
-
-        # 2. Compute Loss from Virtual Views
-        if step >= cfg.virtual_view_start_step and hasattr(self, 'enhanced_data') and self.enhanced_data and cfg.virtual_view_loss_weight > 0:
-            import random
-            sample = random.choice(self.enhanced_data)
-            
-            # Prepare virtual view data
-            device = self.device
-            virtual_pose = sample["pose"].unsqueeze(0).to(device)
-            virtual_K = sample["K"].unsqueeze(0).to(device)
-            virtual_image_id = sample["image_id"].unsqueeze(0).to(device)
-            
-            # Re-render
-            renders_virtual, alphas_virtual, _ = self.rasterize_splats(
-                camtoworlds=virtual_pose,
-                Ks=virtual_K,
-                width=sample["width"],
-                height=sample["height"],
-                sh_degree=sh_degree_to_use,
-                near_plane=cfg.near_plane,
-                far_plane=cfg.far_plane,
-                image_ids=virtual_image_id,
-                render_mode="RGB+ED" if cfg.enable_depth_smooth_loss else "RGB",
-            )
-            
-            colors_virtual = renders_virtual[..., 0:3] if renders_virtual.shape[-1] == 4 else renders_virtual
-            depths_virtual = renders_virtual[..., 3:4] if renders_virtual.shape[-1] == 4 else None
-            
-            if cfg.random_bkgd:
-                colors_virtual = colors_virtual + bkgd * (1.0 - alphas_virtual)
-            
-            # DiFix distillation loss
-            loss_sample = 0.0
-            enhanced_image = sample["enhanced_image"].to(device)
-            if enhanced_image.dim() == 3: enhanced_image = enhanced_image.unsqueeze(0)
-            
-            if cfg.enable_difix_enhancement_loss:
-                l1_loss = F.l1_loss(colors_virtual, enhanced_image)
-                dists_loss = self.dists_loss(colors_virtual, enhanced_image)
-                loss_sample += (l1_loss * cfg.difix_enhancement_l1_weight + dists_loss * 0.01)
-            
-            if cfg.enable_depth_smooth_loss and depths_virtual is not None:
-                loss_sample += depth_smooth_loss_4neighbor(depths_virtual) * cfg.depth_smooth_lambda
-                
-            loss_value = cfg.virtual_view_loss_weight * loss_sample
-            
-        return loss_value
-
-    def train(self):
-        """
-        Main training loop.
-        
-        Workflow:
-        1. Setup configuration and directories.
-        2. Initialize data loaders and schedulers.
-        3. Pre-training tasks (allocate buffers, initial renders).
-        4. Loop over steps:
-           a. Fetch data batch.
-           b. Optimize camera poses.
-           c. Rasterize 3D Gaussians.
-           d. Compute losses (RGB, Depth, Regularization).
-           e. Compute Virtual View Loss (DiFix3D).
-           f. Backward pass and optimization step.
-           g. Logging and Checkpointing.
-        """
-        cfg = self.cfg
-        device = self.device
-        world_rank = self.world_rank
-        world_size = self.world_size
-
-        self._save_config()
-        max_steps = cfg.max_steps
-        init_step = 0
-
-        schedulers, pose_scheduler = self._create_schedulers()
-        trainloader = self._init_trainloader()
         trainloader_iter = iter(trainloader)
 
-        self._pre_training_tasks()
+        if cfg.visualize_cameras:
+            self._init_viewer_state()
+
+        # Collect training camera data before training starts
+        if world_rank == 0:
+            print("Start collecting training camera poses...")
+            self.collect_train_camera_data()
+
+            # Save initialization PLY and render trajectory
+            print("Saving initialization ply and rendering trajectory...")
+            if cfg.save_ply:
+                self.save_gsply(0)
+            
+            self.render_traj(step=0)
 
         # Training loop.
         global_tic = time.time()
@@ -803,8 +722,8 @@ class DeblurDiFix3DRunner(Runner):
             else:
                 colors, depths = renders, None
 
-            bkgd = torch.rand(1, 3, device=device) if cfg.random_bkgd else torch.zeros(1, 3, device=device)
             if cfg.random_bkgd:
+                bkgd = torch.rand(1, 3, device=device)
                 colors = colors + bkgd * (1.0 - alphas)
             
             
@@ -814,14 +733,10 @@ class DeblurDiFix3DRunner(Runner):
             colors = colors.mean(0)[None]
             
 
-            # Virtual View Loss (DiFix3D)
-            virtual_view_loss_to_add = self._compute_virtual_view_loss(step, bkgd, sh_degree_to_use)
-
-            if False: # Removed old logic
-                 virtual_view_loss_to_add_old = 0.0
+            virtual_view_loss_to_add = 0.0  
 
             print(f" Check hybrid sampling: step={step}, virtual_view_start_step={cfg.virtual_view_start_step}, enable_difix3d={cfg.enable_difix3d}, difix3d_processor={self.difix3d_processor is not None}, step%interval={step % cfg.virtual_view_interval}")
-            if False and step >= cfg.virtual_view_start_step and cfg.enable_difix3d and self.difix3d_processor is not None and step % cfg.virtual_view_interval == 0:
+            if step >= cfg.virtual_view_start_step and cfg.enable_difix3d and self.difix3d_processor is not None and step % cfg.virtual_view_interval == 0:
                 if step == cfg.virtual_view_start_step:
                     print(f" Step {step}: first enable hybrid-sampling virtual view training")
                 else:
@@ -957,10 +872,14 @@ class DeblurDiFix3DRunner(Runner):
                         print(f"   Weight: {cfg.virtual_view_loss_weight}")
                         if cfg.enable_depth_smooth_loss:
                             print(f"    Depth smooth loss enabled, weight: {cfg.depth_smooth_lambda}")
+                    
+
             else:
                 # Before start step, virtual view loss is 0
                 virtual_view_loss_to_add = 0.0
                 
+           
+
             if cfg.use_bilateral_grid:
                 grid_y, grid_x = torch.meshgrid(
                     (torch.arange(height, device=self.device) + 0.5) / height,
@@ -969,6 +888,7 @@ class DeblurDiFix3DRunner(Runner):
                 )
                 grid_xy = torch.stack([grid_x, grid_y], dim=-1).unsqueeze(0)
                 colors = slice(self.bil_grids, grid_xy, colors, image_ids)["rgb"]
+
 
             self.cfg.strategy.step_pre_backward(
                 params=self.splats,

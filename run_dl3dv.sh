@@ -11,7 +11,7 @@ RESULTS_DIR="$DATA_DIR/render_results"
 SCRIPT_TRAINER="render/simple_deblur_difix.py"
 
 # Set GPU device
-export CUDA_VISIBLE_DEVICES=1
+export CUDA_VISIBLE_DEVICES=2
 
 # Create results directory
 mkdir -p "$RESULTS_DIR"

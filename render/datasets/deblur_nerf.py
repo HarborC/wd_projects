@@ -50,7 +50,6 @@ class DeblurNerfDataset(Dataset):
         parser: ColmapParser,
         split: str = "train",
         patch_size: Optional[int] = None,
-        load_depths: bool = False,
     ):
         # find the file named `hold=n` , n is the eval_interval to be recognized
         hold_file = [f for f in os.listdir(parser.data_dir) if f.startswith("hold=")]
@@ -62,7 +61,7 @@ class DeblurNerfDataset(Dataset):
         if split == "train" and parser.test_every < 1:
             split = "all"
 
-        super().__init__(parser, split, patch_size, load_depths)
+        super().__init__(parser, split, patch_size)
 
         # "test" for deblur, "val" for novel-view
         if split == "val" and parser.test_every < 1:

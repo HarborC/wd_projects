@@ -19,7 +19,7 @@ opencv-python
 viser
 pillow_heif
 scipy
-huggingface-hub[torch]>=0.22
+huggingface-hub[torch]==0.25.0
 ninja
 jaxtyping
 lpips 
@@ -34,3 +34,8 @@ nerfview==0.0.2
 tensorboard
 pypose
 tensorly
+transformers==4.38.0
+diffusers==0.25.1
+accelerate
+peft==0.9.0
+# gradio==5.0

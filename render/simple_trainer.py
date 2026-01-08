@@ -167,7 +167,7 @@ class Config:
     bilateral_grid_shape: Tuple[int, int, int] = (16, 16, 8)
 
     # Enable depth loss. (experimental)
-    depth_loss: bool = False
+    depth_loss: bool = True
     # Weight for depth loss
     depth_lambda: float = 1e-2
 
@@ -346,12 +346,12 @@ class Runner:
             factor=cfg.data_factor,
             normalize=cfg.normalize_world_space,
             test_every=cfg.test_every,
+            adjust_scene=(cfg.init_type!="gsply"),
         )
         self.trainset = Dataset(
             self.parser,
             split="train",
             patch_size=cfg.patch_size,
-            load_depths=cfg.depth_loss,
         )
         self.valset = Dataset(self.parser, split="val")
         self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
