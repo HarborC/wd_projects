@@ -97,8 +97,6 @@ python "$SCRIPT_TRAINER" default \
     --data-dir "$DATA_DIR" \
     --result-dir "$RESULTS_DIR" \
     --disable-viewer \
-    --virtual-view-start-step 1500 \
-    --virtual-view-interval 200 \
     --max-steps 7000 \
     --camera-optimizer.mode $TRAJ_TYPE \
     --init-ply-path "$DATA_DIR/gaussians.ply" \

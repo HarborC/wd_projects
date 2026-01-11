@@ -14,3 +14,8 @@ python simple_inference.py \
 conda create -n wd python=3.10
 conda activate wd
 pip install torch==2.7.0 torchvision==0.22.0 torchaudio==2.7.0 xformers==0.0.30 --index-url https://download.pytorch.org/whl/cu128
+
+pip install --no-build-isolation "git+https://github.com/facebookresearch/pytorch3d.git@stable"
+
+cd /data/cjg/projects/wd_projects/reconstruction/mast3r/dust3r/croco/models/curope
+python setup.py build_ext --inplace

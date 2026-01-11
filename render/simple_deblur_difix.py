@@ -73,7 +73,6 @@ class DeblurDiFix3DConfig(Config):
     
     # Evaluation settings
     eval_only: bool = False
-    eval_steps: List[int] = field(default_factory=lambda: [1_000, 3_000, 7_000])
     scale_factor: float = 1.0
     result_dir: str = "path_of_your_result"
     test_every: int = 0
@@ -155,17 +154,15 @@ class DeblurDiFix3DConfig(Config):
 
     difix3d_guidance_scale: float = 0.0
 
-    difix3d_use_ref_image: bool = True
-
     difix3d_augment_training_set: bool = True
     
     difix3d_max_augmented_samples: int = 100
 
     difix3d_save_comparisons: bool = True
 
-    virtual_view_start_step: int = 25000
+    virtual_view_start_step: int = 100
 
-    virtual_view_interval: int = 250
+    virtual_view_interval: int = 100
 
     virtual_view_poses_per_step: int = 2
 
@@ -299,6 +296,8 @@ class DeblurDiFix3DRunner(Runner):
         # Track hybrid sampling state
         self.hybrid_sampling_initialized = False
 
+        self.enhanced_data = []
+
     def _init_directories(self):
         """Initialize all output directories."""
         cfg = self.cfg
@@ -351,13 +350,10 @@ class DeblurDiFix3DRunner(Runner):
         """Initialize DiFix3D processor."""
         cfg = self.cfg
         if cfg.enable_difix3d:
-            self.ref_image_dir = f"{cfg.data_dir}/ref_image"
-            print(f" Reference image directory: {self.ref_image_dir}")
             print(" Initializing DiFix3D processor...")
             self.difix3d_processor = DiFix3DProcessor(
                 model_name=cfg.difix3d_model_name,
                 device=self.device,
-                ref_image_dir=self.ref_image_dir
             )
             if self.difix3d_processor.enabled:
                 print(f" DiFix3D processor initialized")
@@ -518,7 +514,6 @@ class DeblurDiFix3DRunner(Runner):
             else:
                 print("Unable to get camera poses from training dataset")
 
-
     def collect_virtual_camera_data(self, camera_poses: torch.Tensor = None, enhanced_samples: List[dict] = None, step: int = None, source: str = "unknown"):
         """
         Collect virtual camera poses (unified interface)
@@ -551,17 +546,12 @@ class DeblurDiFix3DRunner(Runner):
                 for i, pose in enumerate(virtual_poses):
                     print(f"   virtual_poses[{i}]: device={pose.device}, shape={pose.shape}")
                 
-                try:
-                    virtual_cameras_batch = torch.cat(virtual_poses, dim=0)  # [N, 4, 4]
-                    self.virtual_camera_batches.append(virtual_cameras_batch)
-                    print(f"Collected {len(virtual_poses)} {source} virtual cameras")
-                    print(f"    Current virtual camera batch count: {len(self.virtual_camera_batches)}")
-                    total_virtual_cameras = sum(len(batch) for batch in self.virtual_camera_batches)
-                    print(f"    Current total virtual cameras: {total_virtual_cameras}")
-                except Exception as e:
-                    print(f" torch.cat failed: {e}")
-                    print(f"   Tensor devices: {[pose.device for pose in virtual_poses]}")
-                    raise e
+                virtual_cameras_batch = torch.cat(virtual_poses, dim=0)  # [N, 4, 4]
+                self.virtual_camera_batches.append(virtual_cameras_batch)
+                print(f"Collected {len(virtual_poses)} {source} virtual cameras")
+                print(f"    Current virtual camera batch count: {len(self.virtual_camera_batches)}")
+                total_virtual_cameras = sum(len(batch) for batch in self.virtual_camera_batches)
+                print(f"    Current total virtual cameras: {total_virtual_cameras}")
 
     def _save_config(self):
         """Save configuration to file."""
@@ -636,18 +626,12 @@ class DeblurDiFix3DRunner(Runner):
         if step >= cfg.virtual_view_start_step and cfg.enable_difix3d and self.difix3d_processor is not None and step % cfg.virtual_view_interval == 0:
             enhanced_samples = self.difix3d_processor.process_virtual_views_batch(
                 trainset=self.trainset,
-                camera_optimizer=self.camera_optimizer,
                 rasterize_splats_fn=self.rasterize_splats,
-                cfg=cfg,
-                step=step,
-                save_comparisons=cfg.difix3d_save_comparisons,
+                cfg=cfg, step=step,
                 comparison_dir=self.difix3d_comparison_dir
             )
             
-            if enhanced_samples:
-                if not hasattr(self, 'enhanced_data') or not isinstance(self.enhanced_data, list):
-                    self.enhanced_data = []
-                
+            if enhanced_samples:                
                 # Update sample buffer
                 max_samples = getattr(cfg, 'difix3d_max_augmented_samples', 100)
                 for enhanced_sample in enhanced_samples:
@@ -661,50 +645,50 @@ class DeblurDiFix3DRunner(Runner):
                 if step % 1000 == 0:
                     print(f"Progressive interpolation: {len(enhanced_samples)} new samples")
 
-        # 2. Compute Loss from Virtual Views
-        if step >= cfg.virtual_view_start_step and hasattr(self, 'enhanced_data') and self.enhanced_data and cfg.virtual_view_loss_weight > 0:
-            import random
-            sample = random.choice(self.enhanced_data)
-            
-            # Prepare virtual view data
-            device = self.device
-            virtual_pose = sample["pose"].unsqueeze(0).to(device)
-            virtual_K = sample["K"].unsqueeze(0).to(device)
-            virtual_image_id = sample["image_id"].unsqueeze(0).to(device)
-            
-            # Re-render
-            renders_virtual, alphas_virtual, _ = self.rasterize_splats(
-                camtoworlds=virtual_pose,
-                Ks=virtual_K,
-                width=sample["width"],
-                height=sample["height"],
-                sh_degree=sh_degree_to_use,
-                near_plane=cfg.near_plane,
-                far_plane=cfg.far_plane,
-                image_ids=virtual_image_id,
-                render_mode="RGB+ED" if cfg.enable_depth_smooth_loss else "RGB",
-            )
-            
-            colors_virtual = renders_virtual[..., 0:3] if renders_virtual.shape[-1] == 4 else renders_virtual
-            depths_virtual = renders_virtual[..., 3:4] if renders_virtual.shape[-1] == 4 else None
-            
-            if cfg.random_bkgd:
-                colors_virtual = colors_virtual + bkgd * (1.0 - alphas_virtual)
-            
-            # DiFix distillation loss
-            loss_sample = 0.0
-            enhanced_image = sample["enhanced_image"].to(device)
-            if enhanced_image.dim() == 3: enhanced_image = enhanced_image.unsqueeze(0)
-            
-            if cfg.enable_difix_enhancement_loss:
-                l1_loss = F.l1_loss(colors_virtual, enhanced_image)
-                dists_loss = self.dists_loss(colors_virtual, enhanced_image)
-                loss_sample += (l1_loss * cfg.difix_enhancement_l1_weight + dists_loss * 0.01)
-            
-            if cfg.enable_depth_smooth_loss and depths_virtual is not None:
-                loss_sample += depth_smooth_loss_4neighbor(depths_virtual) * cfg.depth_smooth_lambda
+            # 2. Compute Loss from Virtual Views
+            if len(self.enhanced_data) > 0:
+                import random
+                sample = random.choice(self.enhanced_data)
                 
-            loss_value = cfg.virtual_view_loss_weight * loss_sample
+                # Prepare virtual view data
+                device = self.device
+                virtual_pose = sample["pose"].unsqueeze(0).to(device)
+                virtual_K = sample["K"].unsqueeze(0).to(device)
+                virtual_image_id = sample["image_id"].unsqueeze(0).to(device)
+                
+                # Re-render
+                renders_virtual, alphas_virtual, _ = self.rasterize_splats(
+                    camtoworlds=virtual_pose,
+                    Ks=virtual_K,
+                    width=sample["width"],
+                    height=sample["height"],
+                    sh_degree=sh_degree_to_use,
+                    near_plane=cfg.near_plane,
+                    far_plane=cfg.far_plane,
+                    image_ids=virtual_image_id,
+                    render_mode="RGB+ED" if cfg.enable_depth_smooth_loss else "RGB",
+                )
+                
+                colors_virtual = renders_virtual[..., 0:3] if renders_virtual.shape[-1] == 4 else renders_virtual
+                depths_virtual = renders_virtual[..., 3:4] if renders_virtual.shape[-1] == 4 else None
+                
+                if cfg.random_bkgd:
+                    colors_virtual = colors_virtual + bkgd * (1.0 - alphas_virtual)
+                
+                # DiFix distillation loss
+                loss_sample = 0.0
+                enhanced_image = sample["enhanced_image"].to(device)
+                if enhanced_image.dim() == 3: enhanced_image = enhanced_image.unsqueeze(0)
+                
+                if cfg.enable_difix_enhancement_loss:
+                    l1_loss = F.l1_loss(colors_virtual, enhanced_image)
+                    dists_loss = self.dists_loss(colors_virtual, enhanced_image)
+                    loss_sample += (l1_loss * cfg.difix_enhancement_l1_weight + dists_loss * 0.01)
+                
+                if cfg.enable_depth_smooth_loss and depths_virtual is not None:
+                    loss_sample += depth_smooth_loss_4neighbor(depths_virtual) * cfg.depth_smooth_lambda
+                    
+                loss_value = cfg.virtual_view_loss_weight * loss_sample
             
         return loss_value
 
@@ -841,7 +825,6 @@ class DeblurDiFix3DRunner(Runner):
         """
         cfg = self.cfg
         device = self.device
-        world_rank = self.world_rank
 
         self._save_config()
         max_steps = cfg.max_steps
@@ -1025,7 +1008,6 @@ class DeblurDiFix3DRunner(Runner):
              self.eval_with_pose_opt(step, "nvs", self.valset)
         self.render_traj(step)
 
-        
         if self.world_rank == 0:
             total_virtual_cameras = sum(len(batch) for batch in self.virtual_camera_batches)
             total_cameras = (len(self.all_train_cameras) if self.all_train_cameras is not None else 0) + total_virtual_cameras
@@ -1035,10 +1017,8 @@ class DeblurDiFix3DRunner(Runner):
                     if len(batch) > 0:
                         positions = batch[:, :3, 3].cpu().numpy()
 
-            
             # if self.difix3d_processor is not None:
             #     self.difix3d_processor.save_quality_scores_to_json(step=max_steps-1, result_dir=self.result_dir)
-
 
     def save_gsply(self, step: int = 0):
         if self.cfg.app_opt:
@@ -1072,15 +1052,12 @@ class DeblurDiFix3DRunner(Runner):
             save_to=f"{self.ply_dir}/point_cloud_{step}.ply",
         )
 
-
     @torch.no_grad()
     def eval_deblur(self, step: int, stage: str, dataset: Dataset):
         """Entry for evaluation."""
         print("Running evaluation...")
         cfg = self.cfg
         device = self.device
-        world_rank = self.world_rank
-        world_size = self.world_size
 
         testloader = torch.utils.data.DataLoader(dataset, batch_size=1, shuffle=False, num_workers=1)
         ellipse_time = 0
@@ -1111,7 +1088,7 @@ class DeblurDiFix3DRunner(Runner):
             torch.cuda.synchronize()
             ellipse_time += time.time() - tic
 
-            if world_rank == 0:
+            if self.world_rank == 0:
                 # write images
                 canvas = torch.cat([pixels, colors], dim=2).squeeze(0).cpu().numpy()
                 imageio.imwrite(f"{self.render_dir}/{step:04d}_{stage}_{i:04d}.png", (canvas * 255).astype(np.uint8))
@@ -1133,7 +1110,7 @@ class DeblurDiFix3DRunner(Runner):
                         f"{self.render_dir}/{step:04d}_{stage}_{i:04d}_corrected.png", (canvas * 255).astype(np.uint8)
                     )
 
-        if world_rank == 0:
+        if self.world_rank == 0:
             ellipse_time /= len(testloader)
 
             stats = {k: torch.stack(v).mean().item() for k, v in metrics.items()}
@@ -1175,7 +1152,6 @@ class DeblurDiFix3DRunner(Runner):
                 if not k.endswith("_per_sample"): 
                     self.writer.add_scalar(f"{stage}/{k}", v, step)
             self.writer.flush()
-
 
     def eval_with_pose_opt(self, step: int, stage: str, dataset: Dataset):
         """Entry for evaluation."""
@@ -1330,7 +1306,6 @@ class DeblurDiFix3DRunner(Runner):
             for param_group in optimizer.param_groups:
                 param_group["params"][0].requires_grad = True
 
-
     @torch.no_grad()
     def eval_traj(self, step: int):
         # TODO: add gt trajectory
@@ -1339,7 +1314,6 @@ class DeblurDiFix3DRunner(Runner):
         camtoworlds = camera_optimizer.get_cameras()
 
         raise NotImplementedError
-
 
     def _init_viewer_state(self) -> None:
         """Initializes viewer scene with given train dataset"""

@@ -19,7 +19,7 @@ opencv-python
 viser
 pillow_heif
 scipy
-huggingface-hub[torch]==0.25.0
+huggingface-hub[torch]==0.23.5
 ninja
 jaxtyping
 lpips 
@@ -35,7 +35,14 @@ tensorboard
 pypose
 tensorly
 transformers==4.38.0
-diffusers==0.25.1
+diffusers==0.26.0
 accelerate
 peft==0.9.0
-# gradio==5.0
+git+https://github.com/facebookresearch/pytorch3d.git
+kornia
+open-clip-torch==2.17.1
+colorama
+splines
+av
+gradio==6.2.0
+fire
