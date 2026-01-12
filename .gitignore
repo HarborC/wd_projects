@@ -128,7 +128,4 @@ dmypy.json
 # Pyre type checker
 .pyre/
 
-test_code/
-test_data/
-test_undistort_output*
-test_reconstruction_output*
+test*/

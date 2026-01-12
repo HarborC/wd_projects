@@ -346,8 +346,8 @@ if __name__ == '__main__':
 
 """
 python -m reconstruction.factory \
-    --input-dir /home/disk2/jiagangchen/wd_projects/test_data/data2/data_5/all/images \
-    --output-dir /home/disk2/jiagangchen/wd_projects/test_data/data2/data_5/all//test_reconstruction_output \
+    --input-dir ./data/data2 \
+    --output-dir ./test_reconstruction_output2 \
     --backend hunyuanworld \
     --device cuda
 
