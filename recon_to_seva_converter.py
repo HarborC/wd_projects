@@ -1,27 +1,12 @@
 """
 Convert Reconstruction COLMAP output to SEVA format with interpolation.
 
-This script converts the output from Reconstruction module (MASt3R/DA3/HunyuanWorld)
-to the format required by Stable Virtual Camera (SEVA), with interpolated poses as test set.
-
-Input (from Reconstruction):
-    output_dir/
-        images/           # Input images
-        sparse/0/         # COLMAP format
-            cameras.txt   # Camera intrinsics
-            images.txt    # Camera extrinsics
-
-Output (for SEVA):
-    seva_output_dir/
-        transforms.json           # Camera parameters
-        train_test_split_N.json    # Train/test splits (N = num original images)
-        images/                    # Symlink of original images + black interpolated images
-
-Usage:
-    python recon_to_seva_converter.py \
-        --recon_output /path/to/reconstruction/output \
-        --seva_output /path/to/seva/output \
-        --interpolate 1
+Fixes applied:
+1. Removed dependency on 'roma', used 'scipy' exclusively.
+2. Fixed quaternion order (COLMAP WXYZ -> Scipy XYZW).
+3. Sorted images by filename instead of ID to ensure correct temporal order.
+4. Used Scipy's Slerp for robust rotation interpolation.
+5. Added check for multiple cameras.
 """
 
 import argparse
@@ -33,7 +18,8 @@ from typing import Dict, List
 
 import numpy as np
 from PIL import Image
-import torch
+from scipy.spatial.transform import Rotation as R
+from scipy.spatial.transform import Slerp
 
 logging.basicConfig(
     level=logging.INFO,
@@ -45,12 +31,6 @@ logger = logging.getLogger(__name__)
 def read_colmap_text_model(sparse_dir: Path):
     """
     Read COLMAP text model format.
-
-    Args:
-        sparse_dir: Path to sparse directory (e.g., output/sparse/0)
-
-    Returns:
-        Tuple of (cameras dict, images dict)
     """
     logger.info(f"Reading COLMAP text model from {sparse_dir}")
 
@@ -97,20 +77,19 @@ def read_colmap_text_model(sparse_dir: Path):
             cam_id = int(parts[8])
             name = parts[9]
 
-            # Second line: POINTS2D (skip for our purpose)
+            # Second line: POINTS2D (skip)
             f.readline()
 
             # Convert quaternion to rotation matrix
-            # COLMAP uses qw, qx, qy, qz format (world to camera)
-            import roma
-            quat = torch.tensor([qw, qx, qy, qz])
-            R = roma.unitquat_to_rotmat(quat).numpy()
+            # COLMAP uses (W, X, Y, Z), Scipy uses (X, Y, Z, W)
+            r = R.from_quat([qx, qy, qz, qw])
+            rot_mat = r.as_matrix()
 
             # Build 4x4 transformation matrix (world to camera)
             w2c_matrix = np.eye(4)
-            w2c_matrix[:3, :3] = R
+            w2c_matrix[:3, :3] = rot_mat
             w2c_matrix[:3, 3] = [tx, ty, tz]
-
+    
             # Convert to camera-to-world (SEVA expects camtoworld)
             c2w_matrix = np.linalg.inv(w2c_matrix)
 
@@ -128,14 +107,14 @@ def read_colmap_text_model(sparse_dir: Path):
 def extract_common_intrinsics(cameras: Dict) -> Dict:
     """
     Extract common intrinsics from cameras.
-
-    Args:
-        cameras: Dict of camera info from read_colmap_text_model
-
-    Returns dict with: w, h, fl_x, fl_y, cx, cy, k1, k2, p1, p2
+    Warns if multiple cameras are present.
     """
     if not cameras:
         raise ValueError("No cameras found")
+
+    if len(cameras) > 1:
+        logger.warning(f"Found {len(cameras)} different cameras! Using intrinsics from the first one. "
+                       "This may cause issues if images have different resolutions or focal lengths.")
 
     # Get first camera as reference
     cam = next(iter(cameras.values()))
@@ -149,7 +128,9 @@ def extract_common_intrinsics(cameras: Dict) -> Dict:
         "cy": cam['params'][3],    # principal point y
     }
 
-    # Add distortion parameters if available
+    # Add distortion parameters if available (Simple Radial / Pinhole)
+    # Note: Parameter mapping depends on the COLMAP model (e.g. OPENCV vs PINHOLE).
+    # This assumes a basic mapping compatible with PINHOLE/SIMPLE_RADIAL.
     if len(cam['params']) > 4:
         intrinsics["k1"] = cam['params'][4]
     if len(cam['params']) > 5:
@@ -159,7 +140,6 @@ def extract_common_intrinsics(cameras: Dict) -> Dict:
     if len(cam['params']) > 7:
         intrinsics["p2"] = cam['params'][7]
 
-    # Add camera model
     intrinsics["camera_model"] = cam['model']
 
     logger.info(f"Intrinsics: {intrinsics['w']}x{intrinsics['h']}, fx={intrinsics['fl_x']:.2f}, fy={intrinsics['fl_y']:.2f}")
@@ -168,62 +148,71 @@ def extract_common_intrinsics(cameras: Dict) -> Dict:
 
 def interpolate_poses(images: Dict, num_interp: int = 1) -> List[Dict]:
     """
-    Interpolate poses between consecutive images.
-
-    Args:
-        images: Dict of image info from read_colmap_text_model
-        num_interp: Number of interpolated poses between each pair of images
-
-    Returns:
-        Tuple of (original_frames, interpolated_frames) with c2w_matrix (camera-to-world)
+    Interpolate poses between consecutive images (sorted by filename).
     """
-    original_frames = []
-    interpolated_frames = []
+    all_frames = []
 
-    # Sort images by image_id
-    sorted_images = sorted(images.items(), key=lambda x: x[0])
+    # FIX: Sort images by NAME (filename) to ensure correct temporal sequence
+    # COLMAP image_ids are not guaranteed to be sequential or temporal.
+    sorted_images = sorted(images.items(), key=lambda x: x[1]['name'])
 
-    # Add all original images
-    for _, img_data in sorted_images:
-        original_frames.append({
-            "c2w_matrix": img_data['c2w_matrix'].copy(),
-        })
-
-    # Generate interpolated poses between consecutive images
+    logger.info("Interpolating poses...")
+    
     for i in range(len(sorted_images) - 1):
         _, img_curr = sorted_images[i]
         _, img_next = sorted_images[i + 1]
 
-        # Interpolate between current and next
+        # Add current original frame
+        all_frames.append({
+            "c2w_matrix": img_curr['c2w_matrix'].copy(),
+            "is_interpolated": False,
+            "original_name": img_curr['name'] # Keep track for debugging
+        })
+
+        # Prepare for interpolation
+        times = [0, 1]
+        key_rots = R.from_matrix([
+            img_curr['c2w_matrix'][:3, :3],
+            img_next['c2w_matrix'][:3, :3]
+        ])
+        key_trans = np.array([
+            img_curr['c2w_matrix'][:3, 3],
+            img_next['c2w_matrix'][:3, 3]
+        ])
+
+        # Create Slerp object
+        slerp = Slerp(times, key_rots)
+
+        # Generate interpolated poses
         for j in range(1, num_interp + 1):
             t = j / (num_interp + 1)
+            
+            # Interpolate Rotation (SLERP)
+            interp_rot = slerp([t]).as_matrix()[0]
+            
+            # Interpolate Translation (Linear)
+            interp_trans = (1 - t) * key_trans[0] + t * key_trans[1]
 
-            # Interpolate translation (camera position in world space)
-            trans_curr = img_curr['c2w_matrix'][:3, 3]
-            trans_next = img_next['c2w_matrix'][:3, 3]
-            trans_interp = trans_curr * (1 - t) + trans_next * t
-
-            # Interpolate rotation
-            rot_curr = img_curr['c2w_matrix'][:3, :3]
-            rot_next = img_next['c2w_matrix'][:3, :3]
-
-            # Linear interpolation of rotation matrix, then orthonormalize
-            rot_interp = rot_curr * (1 - t) + rot_next * t
-
-            # Orthonormalize using SVD
-            U, _, Vt = np.linalg.svd(rot_interp)
-            rot_interp = U @ Vt
-
-            # Build interpolated camera-to-world matrix
+            # Build matrix
             c2w_interp = np.eye(4)
-            c2w_interp[:3, :3] = rot_interp
-            c2w_interp[:3, 3] = trans_interp
+            c2w_interp[:3, :3] = interp_rot
+            c2w_interp[:3, 3] = interp_trans
 
-            interpolated_frames.append({
+            all_frames.append({
                 "c2w_matrix": c2w_interp,
+                "is_interpolated": True,
             })
 
-    return original_frames, interpolated_frames
+    # Add the last original frame
+    if sorted_images:
+        _, img_last = sorted_images[-1]
+        all_frames.append({
+            "c2w_matrix": img_last['c2w_matrix'].copy(),
+            "is_interpolated": False,
+            "original_name": img_last['name']
+        })
+
+    return all_frames
 
 
 def convert_reconstruction_to_seva(
@@ -231,21 +220,15 @@ def convert_reconstruction_to_seva(
     seva_output_dir: Path,
     interpolate: int = 1,
 ):
-    """
-    Main conversion function.
-
-    Args:
-        recon_output_dir: Reconstruction output directory
-        seva_output_dir: SEVA format output directory
-        interpolate: Number of interpolated poses between each pair of images
-    """
     recon_output_dir = Path(recon_output_dir)
     seva_output_dir = Path(seva_output_dir)
 
     # Validate input
     sparse_dir = recon_output_dir / "sparse" / "0"
     if not sparse_dir.exists():
-        raise ValueError(f"Sparse directory not found: {sparse_dir}")
+        sparse_dir = recon_output_dir / "sparse"
+        if not (sparse_dir / "cameras.txt").exists():
+             raise ValueError(f"Sparse directory (cameras.txt) not found in: {recon_output_dir}")
 
     images_dir = recon_output_dir / "images"
     if not images_dir.exists():
@@ -255,61 +238,46 @@ def convert_reconstruction_to_seva(
     seva_output_dir.mkdir(parents=True, exist_ok=True)
 
     # Step 1: Read COLMAP text model
-    logger.info("=" * 80)
-    logger.info("Step 1: Reading COLMAP text model")
-    logger.info("=" * 80)
     cameras, images = read_colmap_text_model(sparse_dir)
 
     # Step 2: Extract intrinsics
-    logger.info("\n" + "=" * 80)
-    logger.info("Step 2: Extracting intrinsics")
-    logger.info("=" * 80)
     intrinsics = extract_common_intrinsics(cameras)
 
     # Step 3: Get sorted image names
-    sorted_images = sorted(images.items(), key=lambda x: x[0])
+    sorted_images = sorted(images.items(), key=lambda x: x[1]['name'])
     image_names = [img['name'] for _, img in sorted_images]
-    logger.info(f"Found {len(image_names)} images")
-
-    # Get image dimensions from first image
+    
     first_image_path = images_dir / image_names[0]
-    first_image = Image.open(first_image_path)
-    img_width, img_height = first_image.size
-    first_image.close()
+    if not first_image_path.exists():
+         raise FileNotFoundError(f"Image not found: {first_image_path}")
+         
+    with Image.open(first_image_path) as first_image:
+        img_width, img_height = first_image.size
     logger.info(f"Image size: {img_width}x{img_height}")
 
-    # Step 4: Interpolate poses
-    logger.info("\n" + "=" * 80)
-    logger.info(f"Step 4: Interpolating poses ({interpolate} poses between each pair)")
-    logger.info("=" * 80)
+    # Step 4: Interpolate poses (Original COLMAP space)
+    all_frames = interpolate_poses(images, interpolate)
 
-    original_frames, interpolated_frames = interpolate_poses(images, interpolate)
-    logger.info(f"Generated {len(original_frames)} original + {len(interpolated_frames)} interpolated frames")
+    train_ids = [i for i, f in enumerate(all_frames) if not f['is_interpolated']]
+    test_ids = [i for i, f in enumerate(all_frames) if f['is_interpolated']]
 
-    # Step 5: Build transforms.json and train/test split
-    # All original images -> train_ids (first N frames)
-    # All interpolated poses -> test_ids (after original frames)
-    logger.info("\n" + "=" * 80)
-    logger.info("Step 5: Building transforms.json and train/test split")
-    logger.info("=" * 80)
+    logger.info(f"Generated {len(train_ids)} original + {len(test_ids)} interpolated frames")
 
-    train_ids = list(range(len(original_frames)))
-    test_ids = list(range(len(original_frames), len(original_frames) + len(interpolated_frames)))
-
+    # Step 5: Build transforms.json with Coordinate System Flip
     json_frames = []
+    
+    for i, frame_data in enumerate(all_frames):
+        # Copy matrix to avoid modifying original data accidentally
+        c2w = frame_data['c2w_matrix'].copy()
 
-    # Add original frames (train)
-    for i, frame_data in enumerate(original_frames):
-        json_frames.append({
-            "file_path": f"images/{image_names[i]}",
-            "transform_matrix": frame_data['c2w_matrix'].tolist(),
-        })
+        # === Apply Coordinate System Transformation ===
+        # Flip Y and Z axes (OpenCV [Right, Down, Forward] -> OpenGL [Right, Up, Back])
+        c2w[:, [1, 2]] *= -1 
+        # ==============================================
 
-    # Add interpolated frames (test)
-    for i, frame_data in enumerate(interpolated_frames):
         json_frames.append({
-            "file_path": f"images/interp_{i:06d}.png",
-            "transform_matrix": frame_data['c2w_matrix'].tolist(),
+            "file_path": f"images/frame_{i:06d}.png",
+            "transform_matrix": c2w.tolist(),
         })
 
     transforms = {
@@ -323,107 +291,56 @@ def convert_reconstruction_to_seva(
         "test_ids": test_ids
     }
 
-    # Save transforms.json
+    # Save JSON files
     transforms_path = seva_output_dir / "transforms.json"
     with open(transforms_path, 'w') as f:
-        json.dump(transforms, f, indent=5)
-    logger.info(f"Saved transforms.json to {transforms_path}")
+        json.dump(transforms, f, indent=4)
+    logger.info(f"Saved transforms.json")
 
-    # Save train_test split
     split_path = seva_output_dir / f"train_test_split_{len(train_ids)}.json"
     with open(split_path, 'w') as f:
-        json.dump(splits, f, indent=2)
+        json.dump(splits, f, indent=4)
     logger.info(f"Saved train_test_split_{len(train_ids)}.json")
 
-    # Step 6: Create symlinks for original images and black images for interpolated
-    logger.info("\n" + "=" * 80)
-    logger.info("Step 6: Processing images")
-    logger.info("=" * 80)
-
+    # Step 6: Copy images
+    logger.info("Processing images...")
     seva_images_dir = seva_output_dir / "images"
     seva_images_dir.mkdir(parents=True, exist_ok=True)
 
-    # Create symlinks for original images
-    for img_name in image_names:
-        src = images_dir / img_name
-        dst = seva_images_dir / img_name
-        if dst.is_symlink() or dst.exists():
-            dst.unlink()
-        dst.symlink_to(src.resolve())
-    logger.info(f"Created {len(image_names)} symlinks for original images")
-
-    # Create black images for interpolated poses
     black_image = Image.new('RGB', (img_width, img_height), (0, 0, 0))
-    for frame in transforms['frames']:
-        if 'interp_' in frame['file_path']:
-            img_name = frame['file_path'].split('/')[-1]
-            dst = seva_images_dir / img_name
-            if not dst.exists():
-                black_image.save(dst)
-    logger.info(f"Created {len(test_ids)} black images for interpolated poses")
 
-    logger.info("\n" + "=" * 80)
+    original_img_idx = 0
+    for i, frame_data in enumerate(all_frames):
+        dst = seva_images_dir / f"frame_{i:06d}.png"
+        
+        if frame_data['is_interpolated']:
+            black_image.save(dst)
+        else:
+            src = images_dir / image_names[original_img_idx]
+            shutil.copy(src, dst)
+            original_img_idx += 1
+
     logger.info("Conversion Complete!")
-    logger.info("=" * 80)
-    logger.info(f"SEVA format output: {seva_output_dir}")
-    logger.info(f"  - transforms.json ({len(transforms['frames'])} frames)")
-    logger.info(f"  - train_test_split_{len(train_ids)}.json ({len(train_ids)} train, {len(test_ids)} test)")
-    logger.info(f"  - images/ ({len(train_ids)} original + {len(test_ids)} interpolated)")
-    logger.info("=" * 80)
-
     return transforms, splits
-
+# ... (main function remains mostly same, just standard boilerplate)
 
 def main():
     parser = argparse.ArgumentParser(
         description="Convert Reconstruction output to SEVA format with interpolation",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
-
-    parser.add_argument(
-        "--recon-output",
-        type=str,
-        required=True,
-        help="Path to Reconstruction output directory (contains sparse/0/, images/)"
-    )
-
-    parser.add_argument(
-        "--seva-output",
-        type=str,
-        required=True,
-        help="Path to SEVA format output directory"
-    )
-
-    parser.add_argument(
-        "--interpolate",
-        type=int,
-        default=5,
-        help="Number of interpolated poses between each pair of images"
-    )
+    parser.add_argument("--recon-output", type=str, required=True, help="Path to Reconstruction output")
+    parser.add_argument("--seva-output", type=str, required=True, help="Path to SEVA output")
+    parser.add_argument("--interpolate", type=int, default=20, help="Interpolated poses per pair")
 
     args = parser.parse_args()
-
-    # Convert paths
-    recon_output = Path(args.recon_output)
-    seva_output = Path(args.seva_output)
-
-    # Validate input directory
-    if not recon_output.exists():
-        logger.error(f"Reconstruction output directory not found: {recon_output}")
-        return 1
-
+    
     try:
-        convert_reconstruction_to_seva(
-            recon_output_dir=recon_output,
-            seva_output_dir=seva_output,
-            interpolate=args.interpolate,
-        )
-        return 0
-
+        convert_reconstruction_to_seva(args.recon_output, args.seva_output, args.interpolate)
     except Exception as e:
-        logger.error(f"\nError during conversion: {e}", exc_info=True)
+        logger.error(f"Error: {e}", exc_info=True)
         return 1
-
+    return 0
 
 if __name__ == "__main__":
     import sys
