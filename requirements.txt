@@ -46,3 +46,7 @@ splines
 av
 gradio==6.2.0
 fire
+evo
+pyglet==1.5.31
+cython
+icecream

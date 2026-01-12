@@ -19,3 +19,7 @@ pip install --no-build-isolation "git+https://github.com/facebookresearch/pytorc
 
 cd /data/cjg/projects/wd_projects/reconstruction/mast3r/dust3r/croco/models/curope
 python setup.py build_ext --inplace
+
+pip install submodules/simple-knn --no-build-isolation
+pip install submodules/diff-gaussian-rasterization --no-build-isolation
+pip install submodules/fused-ssim --no-build-isolation
