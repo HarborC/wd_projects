@@ -92,7 +92,6 @@ class ReconstructionFactory:
     def create_da3(
         cls,
         device: Optional[str] = None,
-        model_name: str = "depth-anything/DA3NESTED-GIANT-LARGE"
     ) -> DA3Reconstructor:
         """
         Create a DA3 reconstructor (convenience method).
@@ -104,13 +103,12 @@ class ReconstructionFactory:
         Returns:
             DA3Reconstructor: DA3 reconstructor instance.
         """
-        return cls.create('da3', device=device, model_name=model_name)
+        return cls.create('da3', device=device)
 
     @classmethod
     def create_mast3r(
         cls,
         device: Optional[str] = None,
-        ckpt_path: str = '/home/disk2/jiagangchen/LJ/sparse_view/InstantSplat/mast3r/checkpoints/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth'
     ) -> MASt3RReconstructor:
         """
         Create a MASt3R reconstructor (convenience method).
@@ -122,13 +120,12 @@ class ReconstructionFactory:
         Returns:
             MASt3RReconstructor: MASt3R reconstructor instance.
         """
-        return cls.create('mast3r', device=device, ckpt_path=ckpt_path)
+        return cls.create('mast3r', device=device)
 
     @classmethod
     def create_hunyuanworld(
         cls,
         device: Optional[str] = None,
-        model_path: str = "tencent/HunyuanWorld-Mirror"
     ) -> HunyuanWorldReconstructor:
         """
         Create a HunyuanWorld-Mirror reconstructor (convenience method).
@@ -140,7 +137,7 @@ class ReconstructionFactory:
         Returns:
             HunyuanWorldReconstructor: HunyuanWorld-Mirror reconstructor instance.
         """
-        return cls.create('hunyuanworld', device=device, model_path=model_path)
+        return cls.create('hunyuanworld', device=device)
 
     @classmethod
     def register_backend(cls, name: str, reconstructor_class: type):
