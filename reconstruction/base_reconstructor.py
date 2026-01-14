@@ -390,25 +390,3 @@ class BaseReconstructor(ABC):
         confs = np.concatenate(conf_all, 0) if confidence is not None else None  # (M,)
 
         return pts, cols, confs
-
-    def _create_xyf(self, num_frames, height, width):
-        """
-        Creates a grid of pixel coordinates and frame indices (fidx) for all frames.
-        """
-        # Create coordinate grids for a single frame
-        y_grid, x_grid = np.indices((height, width), dtype=np.int32)
-        x_grid = x_grid[np.newaxis, :, :]
-        y_grid = y_grid[np.newaxis, :, :]
-
-        # Broadcast to all frames
-        x_coords = np.broadcast_to(x_grid, (num_frames, height, width))
-        y_coords = np.broadcast_to(y_grid, (num_frames, height, width))
-
-        # Create frame indices and broadcast
-        f_idx = np.arange(num_frames, dtype=np.int32)[:, np.newaxis, np.newaxis]
-        f_coords = np.broadcast_to(f_idx, (num_frames, height, width))
-
-        # Stack coordinates and frame indices
-        points_xyf = np.stack((x_coords, y_coords, f_coords), axis=-1)
-
-        return points_xyf

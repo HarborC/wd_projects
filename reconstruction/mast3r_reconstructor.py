@@ -103,8 +103,7 @@ class MASt3RReconstructor(BaseReconstructor):
         from dust3r.utils.device import to_numpy
         from dust3r.utils.geometry import inv
         from dust3r.cloud_opt import global_aligner, GlobalAlignerMode
-        from utils.sfm_utils import (save_intrinsics, save_extrinsic, save_points3D,
-                                     get_sorted_image_files, load_images, compute_co_vis_masks)
+        from utils.sfm_utils import load_images, compute_co_vis_masks
 
         input_path = Path(input_dir)
         output_path = Path(output_dir)
@@ -122,15 +121,7 @@ class MASt3RReconstructor(BaseReconstructor):
             logger.warning(f"No images found in {input_path}")
             return None
 
-        # Setup paths for backend-specific sparse output
-        sparse_0_path = mast3r_output_dir / 'sparse' / '0'
-        sparse_0_path.mkdir(parents=True, exist_ok=True)
-
-        # Use all images for reconstruction
-        train_img_files = image_files
-        image_suffix = Path(image_files[0]).suffix
-
-        images, org_imgs_shape = load_images(train_img_files, size=image_size)
+        images, org_imgs_shape = load_images(image_files, size=image_size)
 
         start_time = time()
         logger.info(f'>> Making pairs...')
@@ -147,7 +138,9 @@ class MASt3RReconstructor(BaseReconstructor):
         focals = to_numpy(scene.get_focals())
         imgs = np.array(scene.imgs)
         pts3d = np.array(to_numpy(scene.get_pts3d()))
-        depthmaps = to_numpy(scene.im_depthmaps.detach().cpu().numpy())
+        # im_depthmaps stores log(depth), need to exp() to get actual depth
+        depthmaps_log = to_numpy(scene.im_depthmaps.detach().cpu().numpy())
+        depthmaps = np.exp(depthmaps_log)  # Convert log-depth to actual depth
         imshapes = to_numpy(torch.tensor(scene.imshapes))
         confs = np.array([param.detach().cpu().numpy() for param in scene.im_conf])
 
@@ -170,33 +163,6 @@ class MASt3RReconstructor(BaseReconstructor):
         end_time = time()
         Train_Time = end_time - start_time
         logger.info(f"Time taken: {Train_Time} seconds")
-
-        # Save results to mast3r/ directory using InstantSplat's save_points3D
-        focals = np.repeat(focals[0], len(images))
-        logger.info(f'>> Saving results to {sparse_0_path}...')
-
-        save_extrinsic(sparse_0_path, extrinsics_w2c, train_img_files, image_suffix)
-        save_intrinsics(sparse_0_path, focals, org_imgs_shape, imgs.shape, save_focals=True)
-        pts_num = save_points3D(sparse_0_path, imgs, pts3d, confs.reshape(pts3d.shape[0], -1), overlapping_masks, use_masks=co_vis_dsp, save_all_pts=True, save_txt_path=mast3r_output_dir, depth_threshold=depth_thre)
-
-        # Copy COLMAP files and confidence_dsp.npy to unified sparse/0 directory
-        unified_sparse_dir = output_path / "sparse" / "0"
-        unified_sparse_dir.mkdir(parents=True, exist_ok=True)
-        logger.info(f"Copying COLMAP files to {unified_sparse_dir}")
-
-        colmap_files = ['cameras.txt', 'images.txt', 'points3D.txt',
-                       'cameras.bin', 'images.bin', 'points3D.bin']
-
-        for filename in colmap_files:
-            src_file = sparse_0_path / filename
-            if src_file.exists():
-                shutil.copy(src_file, unified_sparse_dir / filename)
-
-        # Copy confidence_dsp.npy for InstantSplat compatibility
-        conf_dsp_src = sparse_0_path / 'confidence_dsp.npy'
-        if conf_dsp_src.exists():
-            shutil.copy(conf_dsp_src, unified_sparse_dir / 'confidence_dsp.npy')
-            logger.info(f"Copied confidence_dsp.npy to {unified_sparse_dir}")
 
         # Construct standard results format (same as HunyuanWorld)
         # Reshape depthmaps from (N, H*W) to (N, H, W, 1) using imshapes
@@ -222,9 +188,9 @@ class MASt3RReconstructor(BaseReconstructor):
         raw_image_size = (org_imgs_shape[1], org_imgs_shape[0])
 
         results = {
-            "image_num": len(train_img_files),
+            "image_num": len(image_files),
             "raw_image_size": raw_image_size,
-            "image_names": [Path(f).name for f in train_img_files],
+            "image_names": [Path(f).name for f in image_files],
             "forward_results": {
                 'imgs': imgs_8u,
                 'poses': extrinsics_w2c,
