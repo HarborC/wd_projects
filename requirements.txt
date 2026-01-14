@@ -50,3 +50,6 @@ evo
 pyglet==1.5.31
 cython
 icecream
+e3nn
+future
+consoleprinter

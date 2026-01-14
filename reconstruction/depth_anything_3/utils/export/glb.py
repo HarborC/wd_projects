@@ -139,25 +139,6 @@ def export_to_glb(
         conf_thr,
     )
 
-    ply_raw_path = "/home/disk2/jiagangchen/LJ/test/reconstructed_pointcloud_world_oooo.ply"
-    try:
-        with open(ply_raw_path, 'w') as f:
-            f.write("ply\n")
-            f.write("format ascii 1.0\n")
-            f.write(f"element vertex {len(points)}\n")
-            f.write("property float x\n")
-            f.write("property float y\n")
-            f.write("property float z\n")
-            f.write("property uchar red\n")
-            f.write("property uchar green\n")
-            f.write("property uchar blue\n")
-            f.write("end_header\n")
-            for p, c in zip(points, colors):
-                f.write(f"{p[0]} {p[1]} {p[2]} {int(c[0])} {int(c[1])} {int(c[2])}\n")
-        print(f"Raw point cloud saved to {ply_raw_path}")
-    except Exception as e:
-        print(f"Warning: Failed to save raw point cloud PLY ({e})")
-
     # 5) Based on first camera orientation + glTF axis system, center by point cloud,
     # construct alignment transform, and apply to point cloud
     A = _compute_alignment_transform_first_cam_glTF_center_by_points(

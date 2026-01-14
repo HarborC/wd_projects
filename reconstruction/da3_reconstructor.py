@@ -14,6 +14,7 @@ import pycolmap
 from pathlib import Path
 from typing import Optional, Union
 from PIL import Image
+import os
 
 from reconstruction.base_reconstructor import BaseReconstructor
 
@@ -99,6 +100,9 @@ class DA3Reconstructor(BaseReconstructor):
             export_format="npz-glb-gs_ply-gs_video-colmap",
             infer_gs=True,
         )
+
+        ply_path = da3_output_path / "gs_ply/0000.ply"
+        os.system(f"cp {ply_path} {output_path / 'gaussians.ply'}")
 
         conf_thresh = get_conf_thresh(conf_pixels=prediction.conf)
         final_mask = prediction.conf >= conf_thresh  # [S, H, W]
