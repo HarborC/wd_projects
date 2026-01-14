@@ -130,17 +130,17 @@ class HunyuanWorldReconstructor(BaseReconstructor):
     def __init__(
         self,
         device: Optional[str] = None,
-        model_path: str = "tencent/HunyuanWorld-Mirror"
+        model_name: str = "tencent/HunyuanWorld-Mirror"
     ):
         """
         Initialize the HunyuanWorld-Mirror reconstructor.
 
         Args:
             device (str, optional): Device to run the model on.
-            model_path (str): Path or HuggingFace ID for HunyuanWorld-Mirror model.
+            model_name (str): Path or HuggingFace ID for HunyuanWorld-Mirror model.
         """
         super().__init__(device)
-        self.model_path = model_path
+        self.model_name = model_name
         self._load_model()
 
     def _load_model(self):
@@ -154,8 +154,8 @@ class HunyuanWorldReconstructor(BaseReconstructor):
 
         from src.models.models.worldmirror import WorldMirror
 
-        logger.info(f"Loading HunyuanWorld-Mirror model: {self.model_path}")
-        self.model = WorldMirror.from_pretrained(self.model_path).to(self.device)
+        logger.info(f"Loading HunyuanWorld-Mirror model: {self.model_name}")
+        self.model = WorldMirror.from_pretrained(self.model_name).to(self.device)
         self.model.eval()
         logger.info("HunyuanWorld-Mirror model loaded successfully")
 

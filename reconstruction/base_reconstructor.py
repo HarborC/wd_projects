@@ -198,16 +198,18 @@ class BaseReconstructor(ABC):
         sparse_dir = output_path / "sparse" / "0"
         sparse_dir.mkdir(parents=True, exist_ok=True)
 
-        points, colors = self._depths_to_world_points_with_colors(
+        points, colors, confidences = self._depths_to_world_points_with_colors(
             results['forward_results']['depths'],
             results['forward_results']['intrs'],
             results['forward_results']['poses'],
             results['forward_results']['imgs'],
             results['forward_results']['masks'][..., None],
+            results['forward_results']['depths_conf']
         )
 
         num_points = len(points)
         logger.info(f"Exporting to COLMAP with {num_points} points")
+
         num_frames = results['image_num']
         h, w = results['forward_results']['imgs'].shape[1:3]
         points_xyf = self._create_xyf(num_frames, h, w)
@@ -293,6 +295,14 @@ class BaseReconstructor(ABC):
 
         # Save points3D.ply
         save_points_ply(sparse_dir / "points3D.ply", points, colors)
+        # Save confidence_dsp.npy for InstantSplat compatibility
+        if confidences is not None and len(confidences) > 0:
+            conf_dsp_path = sparse_dir / 'confidence_dsp.npy'
+            # Reshape to (M, 1) format for consistency with InstantSplat
+            confidences_reshaped = confidences.reshape(-1, 1)
+            np.save(conf_dsp_path, confidences_reshaped)
+            logger.info(f"Saved confidence_dsp.npy to {conf_dsp_path} with shape {confidences_reshaped.shape}")
+
         logger.info(f"Saved COLMAP reconstruction to {sparse_dir}")
 
     def _depths_to_world_points_with_colors(self,
@@ -301,18 +311,32 @@ class BaseReconstructor(ABC):
         ext_w2c: np.ndarray,
         images_u8: np.ndarray,
         mask: np.ndarray | None,
-    ) -> tuple[np.ndarray, np.ndarray]:
+        confidence: np.ndarray | None = None,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
         """
         For each frame, transform (u,v,1) through K^{-1} to get rays,
         multiply by depth to camera frame, then use (w2c)^{-1} to transform to world frame.
-        Simultaneously extract colors.
+        Simultaneously extract colors and confidences.
+
+        Args:
+            depth: Depth maps (N, H, W, 1)
+            K: Camera intrinsics (N, 3, 3)
+            ext_w2c: World-to-camera extrinsics (N, 4, 4) or (N, 3, 4)
+            images_u8: Images in uint8 format (N, H, W, 3)
+            mask: Valid pixel mask (N, H, W) or None
+            confidence: Confidence maps (N, H, W) or None
+
+        Returns:
+            points: 3D points in world coordinates (M, 3)
+            colors: RGB colors for each point (M, 3)
+            confidences: Confidence values for each point (M,) or None
         """
         N, H, W, _ = depth.shape
         us, vs = np.meshgrid(np.arange(W), np.arange(H))
         ones = np.ones_like(us)
         pix = np.stack([us, vs, ones], axis=-1).reshape(-1, 3)  # (H*W,3)
 
-        pts_all, col_all = [], []
+        pts_all, col_all, conf_all = [], [], []
 
         for i in range(N):
             d = depth[i]  # (H,W)
@@ -335,13 +359,25 @@ class BaseReconstructor(ABC):
 
             cols = images_u8[i].reshape(-1, 3)[vidx].astype(np.uint8)  # (M,3)
 
+            # Extract confidence if provided
+            if confidence is not None:
+                conf = confidence[i].reshape(-1)[vidx].astype(np.float32)  # (M,)
+                conf_all.append(conf)
+
             pts_all.append(Xw)
             col_all.append(cols)
 
         if len(pts_all) == 0:
-            return np.zeros((0, 3), dtype=np.float32), np.zeros((0, 3), dtype=np.uint8)
+            if confidence is not None:
+                return np.zeros((0, 3), dtype=np.float32), np.zeros((0, 3), dtype=np.uint8), np.zeros((0,), dtype=np.float32)
+            else:
+                return np.zeros((0, 3), dtype=np.float32), np.zeros((0, 3), dtype=np.uint8), None
 
-        return np.concatenate(pts_all, 0), np.concatenate(col_all, 0)
+        pts = np.concatenate(pts_all, 0)
+        cols = np.concatenate(col_all, 0)
+        confs = np.concatenate(conf_all, 0) if confidence is not None else None  # (M,)
+
+        return pts, cols, confs
 
     def _create_xyf(self, num_frames, height, width):
         """

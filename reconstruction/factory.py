@@ -260,24 +260,6 @@ def main():
         default=None,
         help='Device to use (cuda or cpu). Auto-detect if not specified.'
     )
-    parser.add_argument(
-        '--model-name',
-        type=str,
-        default='depth-anything/DA3NESTED-GIANT-LARGE',
-        help='Model name (for DA3 backend)'
-    )
-    parser.add_argument(
-        '--ckpt-path',
-        type=str,
-        default='/home/disk2/jiagangchen/LJ/sparse_view/InstantSplat/mast3r/checkpoints/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth',
-        help='Checkpoint path (for MASt3R backend)'
-    )
-    parser.add_argument(
-        '--model-path',
-        type=str,
-        default='tencent/HunyuanWorld-Mirror',
-        help='Model path (for HunyuanWorld backend)'
-    )
 
     args = parser.parse_args()
 
@@ -306,17 +288,14 @@ def main():
         if args.backend == 'da3':
             reconstructor = ReconstructionFactory.create_da3(
                 device=args.device,
-                model_name=args.model_name
             )
         elif args.backend == 'mast3r':
             reconstructor = ReconstructionFactory.create_mast3r(
                 device=args.device,
-                ckpt_path=args.ckpt_path
             )
         elif args.backend == 'hunyuanworld':
             reconstructor = ReconstructionFactory.create_hunyuanworld(
                 device=args.device,
-                model_path=args.model_path
             )
         else:
             raise ValueError(f"Unknown backend: {args.backend}")

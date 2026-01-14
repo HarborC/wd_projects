@@ -14,29 +14,11 @@ from pathlib import Path
 from typing import Optional, Union
 from PIL import Image
 from time import time
-
-# Add InstantSplat path
-sys.path.append('/home/disk2/jiagangchen/LJ/sparse_view/InstantSplat')
+import os
 
 from reconstruction.base_reconstructor import BaseReconstructor
 
-# Try importing MASt3R dependencies
-try:
-    from mast3r.model import AsymmetricMASt3R
-    from dust3r.image_pairs import make_pairs
-    from dust3r.inference import inference
-    from dust3r.utils.device import to_numpy
-    from dust3r.utils.geometry import inv
-    from dust3r.cloud_opt import global_aligner, GlobalAlignerMode
-    from utils.sfm_utils import (save_intrinsics, save_extrinsic, save_points3D,
-                                 get_sorted_image_files, load_images, compute_co_vis_masks)
-    MAST3R_AVAILABLE = True
-except ImportError as e:
-    logging.warning(f"Could not import MASt3R dependencies: {e}")
-    MAST3R_AVAILABLE = False
-
 logger = logging.getLogger(__name__)
-
 
 class MASt3RReconstructor(BaseReconstructor):
     """
@@ -48,31 +30,33 @@ class MASt3RReconstructor(BaseReconstructor):
     def __init__(
         self,
         device: Optional[str] = None,
-        ckpt_path: str = '/home/disk2/jiagangchen/LJ/sparse_view/InstantSplat/mast3r/checkpoints/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth'
+        model_name: str = 'checkpoints/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth'
     ):
         """
         Initialize the MASt3R reconstructor.
 
         Args:
             device (str, optional): Device to run the model on.
-            ckpt_path (str): Path to MASt3R checkpoint.
+            model_name (str): Path to MASt3R checkpoint.
         """
-        if not MAST3R_AVAILABLE:
-            raise ImportError("MASt3R dependencies not available")
-
         super().__init__(device)
-        self.ckpt_path = ckpt_path
+        self.model_name = model_name
         self._load_model()
 
     def _load_model(self):
         """Load the MASt3R model."""
-        try:
-            logger.info(f"Loading MASt3R model from: {self.ckpt_path}")
-            self.model = AsymmetricMASt3R.from_pretrained(self.ckpt_path).to(self.device)
-            logger.info("MASt3R model loaded successfully")
-        except Exception as e:
-            logger.error(f"Failed to load MASt3R model: {e}")
-            raise
+
+        mast3r_path = Path(__file__).parent / "mast3r"
+        sys.path.insert(0, str(mast3r_path))
+
+        from mast3r.model import AsymmetricMASt3R
+
+        if not Path(self.model_name).exists():
+            os.system('mkdir -p mast3r && wget https://download.europe.naverlabs.com/ComputerVision/MASt3R/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth -P checkpoints/')
+
+        logger.info(f"Loading MASt3R model from: {self.model_name}")
+        self.model = AsymmetricMASt3R.from_pretrained(self.model_name).to(self.device)
+        logger.info("MASt3R model loaded successfully")
 
     def _process(
         self,
@@ -113,6 +97,14 @@ class MASt3RReconstructor(BaseReconstructor):
             infer_video (bool): Infer video.
             **kwargs: Additional parameters.
         """
+        from dust3r.image_pairs import make_pairs
+        from dust3r.inference import inference
+        from dust3r.utils.device import to_numpy
+        from dust3r.utils.geometry import inv
+        from dust3r.cloud_opt import global_aligner, GlobalAlignerMode
+        from utils.sfm_utils import (save_intrinsics, save_extrinsic, save_points3D,
+                                     get_sorted_image_files, load_images, compute_co_vis_masks)
+
         # TODO
         input_path = Path(input_dir)
         output_path = Path(output_dir)
@@ -187,12 +179,9 @@ class MASt3RReconstructor(BaseReconstructor):
         save_intrinsics(sparse_0_path, focals, org_imgs_shape, imgs.shape, save_focals=True)
         pts_num = save_points3D(sparse_0_path, imgs, pts3d, confs.reshape(pts3d.shape[0], -1), overlapping_masks, use_masks=co_vis_dsp, save_all_pts=True, save_txt_path=mast3r_output_dir, depth_threshold=depth_thre)
 
-        # Copy images to unified images/ directory
-        images_dir = output_path / "images"
-        images_dir.mkdir(parents=True, exist_ok=True)
-        logger.info(f"Copying images to {images_dir}")
-        for img_path in train_img_files:
-            shutil.copy(img_path, images_dir / Path(img_path).name)
+        # Copy images to unified images/ directory using base class method
+        logger.info(f"Copying images to {output_path / 'images'}")
+        self._copy_images(train_img_files, output_path)
 
         # Save depth maps to both mast3r/depths and unified depths/
         mast3r_depths_dir = mast3r_output_dir / "depths"
@@ -226,5 +215,11 @@ class MASt3RReconstructor(BaseReconstructor):
             src_file = sparse_0_path / filename
             if src_file.exists():
                 shutil.copy(src_file, unified_sparse_dir / filename)
+
+        # Copy confidence_dsp.npy for InstantSplat compatibility
+        conf_dsp_src = sparse_0_path / 'confidence_dsp.npy'
+        if conf_dsp_src.exists():
+            shutil.copy(conf_dsp_src, unified_sparse_dir / 'confidence_dsp.npy')
+            logger.info(f"Copied confidence_dsp.npy to {unified_sparse_dir}")
 
         logger.info(f'[INFO] MASt3R Reconstruction completed.')
