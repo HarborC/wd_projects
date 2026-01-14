@@ -203,7 +203,7 @@ class BaseReconstructor(ABC):
             results['forward_results']['intrs'],
             results['forward_results']['poses'],
             results['forward_results']['imgs'],
-            results['forward_results']['masks'][..., None],
+            results['forward_results']['masks'],
             results['forward_results']['depths_conf']
         )
 
@@ -212,11 +212,12 @@ class BaseReconstructor(ABC):
 
         num_frames = results['image_num']
         h, w = results['forward_results']['imgs'].shape[1:3]
-        points_xyf = self._create_xyf(num_frames, h, w)
-        points_xyf = points_xyf[results['forward_results']['masks']]
-        points_xyf = points_xyf.reshape(-1, 3).astype(np.float64, copy=False)
         orig_h, orig_w = results['raw_image_size']
         image_paths = results['image_names']
+
+        # Get point indices per frame to track which points belong to which image
+        # This is needed because points from _depths_to_world_points_with_colors are already filtered by mask
+        mask = results['forward_results']['masks']
 
         # 2. Set Reconstruction
         import pycolmap
@@ -271,17 +272,26 @@ class BaseReconstructor(ABC):
             reconstruction.add_frame(frame)
 
             # set point2d and update track
+            # Find which points belong to this frame by scanning through all points
+            # This is inefficient but works for the current structure
             point2d_list = []
-            points_in_frame = points_xyf[:, 2].astype(np.int32) == fidx
-            for vidx in np.where(points_in_frame)[0]:
-                point2d = points_xyf[vidx][:2]
-                point2d[0] *= sx
-                point2d[1] *= sy
-                point3d_id = point3d_ids[vidx]
-                point2d_list.append(pycolmap.Point2D(point2d, point3d_id))
-                reconstruction.point3D(point3d_id).track.add_element(
-                    image.image_id, len(point2d_list) - 1
-                )
+            current_frame_mask = mask[fidx]
+            valid_y, valid_x = np.where(current_frame_mask)
+
+            # Calculate starting point index for this frame
+            points_before = 0
+            for prev_fidx in range(fidx):
+                points_before += mask[prev_fidx].sum()
+
+            for local_idx, (y, x) in enumerate(zip(valid_y, valid_x)):
+                global_point_idx = points_before + local_idx
+                if global_point_idx < len(point3d_ids):
+                    point2d = np.array([float(x) * sx, float(y) * sy])
+                    point3d_id = point3d_ids[global_point_idx]
+                    point2d_list.append(pycolmap.Point2D(point2d, point3d_id))
+                    reconstruction.point3D(point3d_id).track.add_element(
+                        image.image_id, len(point2d_list) - 1
+                    )
 
             # set and add image
             image.frame_id = image.image_id
@@ -339,7 +349,9 @@ class BaseReconstructor(ABC):
         pts_all, col_all, conf_all = [], [], []
 
         for i in range(N):
-            d = depth[i]  # (H,W)
+            d = depth[i]  # (H,W,1) or (H,W)
+            if d.ndim == 3:
+                d = d.squeeze(-1)  # Remove last dimension if it's 1
             valid = np.isfinite(d) & (d > 0)
             if mask is not None:
                 valid &= mask[i]

@@ -40,8 +40,8 @@ from viser.extras.colmap import (
 
 
 def main(
-    colmap_path: Path = Path(__file__).parent / "test_reconstruction_output/sparse/0",
-    images_path: Path = Path(__file__).parent / "test_reconstruction_output/images",
+    colmap_path: Path = Path(__file__).parent / "../test_reconstruction_output/sparse/0",
+    images_path: Path = Path(__file__).parent / "../test_reconstruction_output/images",
     downsample_factor: int = 2,
     reorient_scene: bool = True,
 ) -> None:

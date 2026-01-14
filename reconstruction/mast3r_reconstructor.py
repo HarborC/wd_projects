@@ -10,6 +10,7 @@ import cv2
 import numpy as np
 import torch
 import sys
+import pickle
 from pathlib import Path
 from typing import Optional, Union
 from PIL import Image
@@ -105,7 +106,6 @@ class MASt3RReconstructor(BaseReconstructor):
         from utils.sfm_utils import (save_intrinsics, save_extrinsic, save_points3D,
                                      get_sorted_image_files, load_images, compute_co_vis_masks)
 
-        # TODO
         input_path = Path(input_dir)
         output_path = Path(output_dir)
         output_path.mkdir(parents=True, exist_ok=True)
@@ -120,7 +120,7 @@ class MASt3RReconstructor(BaseReconstructor):
 
         if not image_files:
             logger.warning(f"No images found in {input_path}")
-            return
+            return None
 
         # Setup paths for backend-specific sparse output
         sparse_0_path = mast3r_output_dir / 'sparse' / '0'
@@ -171,7 +171,7 @@ class MASt3RReconstructor(BaseReconstructor):
         Train_Time = end_time - start_time
         logger.info(f"Time taken: {Train_Time} seconds")
 
-        # Save results to mast3r/ directory
+        # Save results to mast3r/ directory using InstantSplat's save_points3D
         focals = np.repeat(focals[0], len(images))
         logger.info(f'>> Saving results to {sparse_0_path}...')
 
@@ -179,31 +179,7 @@ class MASt3RReconstructor(BaseReconstructor):
         save_intrinsics(sparse_0_path, focals, org_imgs_shape, imgs.shape, save_focals=True)
         pts_num = save_points3D(sparse_0_path, imgs, pts3d, confs.reshape(pts3d.shape[0], -1), overlapping_masks, use_masks=co_vis_dsp, save_all_pts=True, save_txt_path=mast3r_output_dir, depth_threshold=depth_thre)
 
-        # Copy images to unified images/ directory using base class method
-        logger.info(f"Copying images to {output_path / 'images'}")
-        self._copy_images(train_img_files, output_path)
-
-        # Save depth maps to both mast3r/depths and unified depths/
-        mast3r_depths_dir = mast3r_output_dir / "depths"
-        mast3r_depths_dir.mkdir(parents=True, exist_ok=True)
-
-        depths_dir = output_path / "depths"
-        depths_dir.mkdir(parents=True, exist_ok=True)
-        logger.info(f"Saving depth maps to {depths_dir}")
-
-        for i, (depth, imshape) in enumerate(zip(depthmaps, imshapes)):
-            # upsample depth to original image size
-            orig_w, orig_h = Image.open(train_img_files[i]).size
-            depth = depth.reshape(imshape[0], imshape[1])
-            depth_raw = cv2.resize(depth, (orig_w, orig_h), interpolation=cv2.INTER_CUBIC)
-
-            img_name = Path(train_img_files[i]).stem
-
-            # Save to both directories using unified method
-            self._save_depth_map(depth_raw, mast3r_depths_dir / img_name)
-            self._save_depth_map(depth_raw, depths_dir / img_name)
-
-        # Copy only COLMAP standard files to unified sparse/0 directory
+        # Copy COLMAP files and confidence_dsp.npy to unified sparse/0 directory
         unified_sparse_dir = output_path / "sparse" / "0"
         unified_sparse_dir.mkdir(parents=True, exist_ok=True)
         logger.info(f"Copying COLMAP files to {unified_sparse_dir}")
@@ -222,4 +198,59 @@ class MASt3RReconstructor(BaseReconstructor):
             shutil.copy(conf_dsp_src, unified_sparse_dir / 'confidence_dsp.npy')
             logger.info(f"Copied confidence_dsp.npy to {unified_sparse_dir}")
 
+        # Construct standard results format (same as HunyuanWorld)
+        # Reshape depthmaps from (N, H*W) to (N, H, W, 1) using imshapes
+        N = len(images)
+        depths_reshaped = np.zeros((N, imgs.shape[1], imgs.shape[2], 1), dtype=np.float32)
+        for i in range(N):
+            h, w = imshapes[i]
+            depth_flat = depthmaps[i].reshape(h, w)
+            depths_reshaped[i, :, :, 0] = depth_flat
+
+        # Convert imgs to uint8 format if not already
+        if imgs.dtype != np.uint8:
+            imgs_8u = (imgs * 255).astype(np.uint8)
+        else:
+            imgs_8u = imgs
+
+        # Create masks if None - important: masks should be (N, H, W)
+        if overlapping_masks is None:
+            final_mask = np.ones((len(images), imgs.shape[1], imgs.shape[2]), dtype=bool)
+        else:
+            final_mask = overlapping_masks
+
+        raw_image_size = (org_imgs_shape[1], org_imgs_shape[0])
+
+        results = {
+            "image_num": len(train_img_files),
+            "raw_image_size": raw_image_size,
+            "image_names": [Path(f).name for f in train_img_files],
+            "forward_results": {
+                'imgs': imgs_8u,
+                'poses': extrinsics_w2c,
+                'intrs': intrinsics,
+                'depths': depths_reshaped,
+                'depths_conf': confs,
+                'normals': None,
+                'pts3d': pts3d,
+                'pts3d_conf': confs,
+                'masks': final_mask,
+            },
+        }
+
+        # Save results to pickle file
+        results_path = mast3r_output_dir / "results.pkl"
+        with open(results_path, "wb") as f:
+            pickle.dump(results, f)
+        logger.info(f"Saved results to {results_path}")
+
+        # Print results shapes for debugging
+        for key, value in results["forward_results"].items():
+            if isinstance(value, np.ndarray):
+                logger.info(f"{key}: {value.shape}")
+            else:
+                logger.info(f"{key}: {type(value)}")
+
         logger.info(f'[INFO] MASt3R Reconstruction completed.')
+
+        return results
