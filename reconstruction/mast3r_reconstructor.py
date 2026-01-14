@@ -65,17 +65,12 @@ class MASt3RReconstructor(BaseReconstructor):
         output_dir: Union[str, Path],
         image_files: Optional[list] = None,
         image_size=512,
-        n_views=None,
         schedule='cosine',
         lr=0.01,
         niter=300,
-        min_conf_thr=5,
-        llffhold=8,
-        co_vis_dsp=False,
         depth_thre=0.01,
         conf_aware_ranking=False,
         focal_avg=False,
-        infer_video=False,
         **kwargs
     ):
         """
@@ -85,17 +80,12 @@ class MASt3RReconstructor(BaseReconstructor):
             input_dir (str or Path): Directory containing input images.
             output_dir (str or Path): Directory to save reconstruction results.
             image_size (int): Size to resize images to.
-            n_views (int, optional): Number of views to use.
             schedule (str): Learning rate schedule.
             lr (float): Learning rate.
             niter (int): Number of iterations.
-            min_conf_thr (float): Minimum confidence threshold.
-            llffhold (int): LLFF hold parameter.
-            co_vis_dsp (bool): Use co-visibility masking.
             depth_thre (float): Depth threshold for co-visibility.
             conf_aware_ranking (bool): Use confidence-aware ranking.
             focal_avg (bool): Use average focal length.
-            infer_video (bool): Infer video.
             **kwargs: Additional parameters.
         """
         from dust3r.image_pairs import make_pairs

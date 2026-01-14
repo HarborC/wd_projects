@@ -11,6 +11,7 @@ from reconstruction.base_reconstructor import BaseReconstructor
 from reconstruction.da3_reconstructor import DA3Reconstructor
 from reconstruction.mast3r_reconstructor import MASt3RReconstructor
 from reconstruction.hunyuanworld_reconstructor import HunyuanWorldReconstructor
+from reconstruction.vggt_reconstructor import VGGTReconstructor
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +29,7 @@ class ReconstructionFactory:
         'da3': DA3Reconstructor,
         'mast3r': MASt3RReconstructor, # mast3r depth you wenti
         'hunyuanworld': HunyuanWorldReconstructor,
+        'vggtx': VGGTReconstructor,
     }
 
     @classmethod
@@ -140,6 +142,22 @@ class ReconstructionFactory:
         return cls.create('hunyuanworld', device=device)
 
     @classmethod
+    def create_vggtx(
+        cls,
+        device: Optional[str] = None,
+    ) -> VGGTReconstructor:
+        """
+        Create a VGGT-X reconstructor (convenience method).
+
+        Args:
+            device (str, optional): Device to run the model on.
+
+        Returns:
+            VGGTReconstructor: VGGT-X reconstructor instance.
+        """
+        return cls.create('vggtx', device=device)
+
+    @classmethod
     def register_backend(cls, name: str, reconstructor_class: type):
         """
         Register a new reconstructor backend.
@@ -248,7 +266,7 @@ def main():
         '--backend',
         type=str,
         default='da3',
-        choices=['da3', 'mast3r', 'hunyuanworld'],
+        choices=['da3', 'mast3r', 'hunyuanworld', 'vggtx'],
         help='Backend to use for reconstruction'
     )
     parser.add_argument(
@@ -292,6 +310,10 @@ def main():
             )
         elif args.backend == 'hunyuanworld':
             reconstructor = ReconstructionFactory.create_hunyuanworld(
+                device=args.device,
+            )
+        elif args.backend == 'vggtx':
+            reconstructor = ReconstructionFactory.create_vggtx(
                 device=args.device,
             )
         else:
