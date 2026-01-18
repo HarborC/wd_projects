@@ -22,6 +22,10 @@ class ReconstructionStage(BaseStage):
         - mast3r: MASt3R multi-view stereo
         - hunyuanworld: HunyuanWorld Mirror
         - vggtx: VGGT-X
+
+    Output:
+        Generates 3D reconstruction in COLMAP format and converts to SEVA format
+        for downstream processing.
     """
 
     def __init__(self, config: dict):
@@ -32,8 +36,10 @@ class ReconstructionStage(BaseStage):
             config: Configuration dictionary with keys:
                 - method (str): Reconstruction method
                 - device (str, optional): Device to use ('cuda' or 'cpu')
+                - seva_interpolate (int, optional): Number of interpolated poses per pair
         """
         super().__init__(config)
+        self.seva_interpolate = self.config.get("seva_interpolate", 20)
         self.reconstructor = self._create_reconstructor()
 
     def _create_reconstructor(self):
@@ -47,6 +53,30 @@ class ReconstructionStage(BaseStage):
             backend=method,
             device=device
         )
+
+    def _convert_to_seva(self, output_dir: str) -> None:
+        """
+        Convert reconstruction output to SEVA format.
+
+        Args:
+            output_dir: Directory containing reconstruction output
+        """
+        try:
+            from scripts.recon_to_seva_converter import convert_reconstruction_to_seva
+
+            seva_output_dir = Path(output_dir) / "seva"
+            self.logger.info(f"Converting to SEVA format with interpolate={self.seva_interpolate}")
+
+            convert_reconstruction_to_seva(
+                recon_output_dir=Path(output_dir),
+                seva_output_dir=seva_output_dir,
+                interpolate=self.seva_interpolate
+            )
+
+            self.logger.info(f"SEVA format saved to: {seva_output_dir}")
+
+        except Exception as e:
+            self.logger.warning(f"Failed to convert to SEVA format: {e}")
 
     def run(self, input_dir: str, output_dir: str) -> StageOutput:
         """
@@ -68,7 +98,14 @@ class ReconstructionStage(BaseStage):
 
         self.reconstructor.process_directory(input_dir, output_dir)
 
+        # Convert to SEVA format
+        self._convert_to_seva(output_dir)
+
         return StageOutput(
             output_dir=output_dir,
-            metadata={"method": self.config.get("method"), "device": self.config.get("device")}
+            metadata={
+                "method": self.config.get("method"),
+                "device": self.config.get("device"),
+                "seva_interpolate": self.seva_interpolate
+            }
         )
