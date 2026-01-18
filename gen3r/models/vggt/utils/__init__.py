@@ -1,1 +1,1 @@
-"""VGGT utility functions."""
+"""Utility modules for VGGT model."""
