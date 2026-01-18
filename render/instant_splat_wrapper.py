@@ -6,7 +6,7 @@ for integration with the pipeline.
 """
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Dict
 import logging
 
 logger = logging.getLogger(__name__)
@@ -27,14 +27,14 @@ class InstantSplatWrapper:
 
         Args:
             config: Configuration dictionary with keys:
-                - instant_splat_path: Path to InstantSplat code
                 - iterations: Training iterations (default: 3000)
                 - resolution: Output resolution [width, height]
+                - sh_degree: Spherical harmonics degree (default: 0)
+                - densify_until_iter: Densification iterations (default: 0)
         """
         self.config = config
-        self.instant_splat_path = Path(config.get("instant_splat_path",
-                                                    "test_code/InstantSplat"))
         self.iterations = config.get("iterations", 3000)
+        self.resolution = config.get("resolution", [1920, 1080])
 
     def train(self, colmap_dir: str, output_dir: str) -> str:
         """
@@ -47,13 +47,22 @@ class InstantSplatWrapper:
         Returns:
             Path to trained model directory
         """
-        # TODO: Implement training wrapper
+        from render.train import train_gaussians
+
         logger.info(f"Training 3DGS model from {colmap_dir}")
-        raise NotImplementedError("Training not yet implemented")
+
+        return train_gaussians(
+            colmap_dir=colmap_dir,
+            output_dir=output_dir,
+            iterations=self.iterations,
+            resolution=self.resolution,
+            sh_degree=self.config.get("sh_degree", 0),
+            densify_until_iter=self.config.get("densify_until_iter", 0),
+        )
 
     def render_interpolated_video(self, model_dir: str,
                                    frames_per_pair: int,
-                                   output_dir: str) -> dict:
+                                   output_dir: str) -> Dict[str, str]:
         """
         Render interpolated video from trained model.
 
@@ -65,6 +74,12 @@ class InstantSplatWrapper:
         Returns:
             Dictionary with output paths
         """
-        # TODO: Implement rendering wrapper
+        from render.render import render_interpolated
+
         logger.info(f"Rendering video from {model_dir}")
-        raise NotImplementedError("Rendering not yet implemented")
+
+        return render_interpolated(
+            model_dir=model_dir,
+            frames_per_pair=frames_per_pair,
+            output_dir=output_dir
+        )

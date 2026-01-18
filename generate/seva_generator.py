@@ -4,6 +4,7 @@ SEVA (Stable Virtual Camera) generator wrapper.
 This module wraps the SEVA diffusion model for novel view generation.
 """
 from pathlib import Path
+from typing import Dict
 import logging
 
 logger = logging.getLogger(__name__)
@@ -27,13 +28,13 @@ class SevaGenerator:
                 - guidance_scale: Diffusion guidance scale
                 - num_inference_steps: Number of diffusion steps
         """
-        self.model_path = Path(config.get("model_path",
-                                           "test_code/stable-virtual-camera"))
-        self.guidance_scale = config.get("guidance_scale", 5.0)
-        self.num_inference_steps = config.get("num_inference_steps", 25)
+        self.config = config
+        self.model_path = config.get("model_path", "stabilityai/stable-virtual-camera")
+        self.guidance_scale = config.get("guidance_scale", 2.0)
+        self.num_inference_steps = config.get("num_inference_steps", 50)
 
     def generate(self, colmap_dir: str, frames_per_pair: int,
-                 output_dir: str) -> dict:
+                 output_dir: str) -> Dict[str, str]:
         """
         Generate novel views along interpolated trajectory.
 
@@ -45,6 +46,17 @@ class SevaGenerator:
         Returns:
             Dictionary with output paths
         """
-        # TODO: Implement generation wrapper
+        from generate.infer import run_seva_inference
+
         logger.info(f"Generating views from {colmap_dir}")
-        raise NotImplementedError("Generation not yet implemented")
+
+        return run_seva_inference(
+            colmap_dir=colmap_dir,
+            output_dir=output_dir,
+            task="img2img",
+            traj_prior="interpolated",
+            frames_per_pair=frames_per_pair,
+            model_path=self.model_path,
+            guidance_scale=self.guidance_scale,
+            num_steps=self.num_inference_steps
+        )
