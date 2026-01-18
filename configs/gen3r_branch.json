@@ -1,0 +1,15 @@
+{
+    "branch": "gen3r",
+    "undistort": {
+        "method": "anycalib",
+        "output_dir": "undistorted",
+        "intrinsics_path": "undistorted/intrinsics.json"
+    },
+    "gen3r": {
+        "task": "allview",
+        "prompts": "a beautiful scene",
+        "model_path": "test_code/Gen3R/checkpoints",
+        "device": "cuda",
+        "output_dir": "gen3r_output"
+    }
+}

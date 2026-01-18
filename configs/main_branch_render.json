@@ -1,0 +1,26 @@
+{
+    "branch": "main",
+    "undistort": {
+        "method": "geocalib",
+        "output_dir": "undistorted",
+        "intrinsics_path": "undistorted/intrinsics.json"
+    },
+    "reconstruction": {
+        "method": "hunyuanworld",
+        "device": "cuda",
+        "output_dir": "reconstruction",
+        "seva_interpolate": 20
+    },
+    "output": {
+        "method": "render",
+        "interpolation": {
+            "frames_per_pair": 20
+        },
+        "output_dir": "output"
+    },
+    "render": {
+        "instant_splat_path": "test_code/InstantSplat",
+        "iterations": 3000,
+        "resolution": [1920, 1080]
+    }
+}
