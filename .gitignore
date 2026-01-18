@@ -130,3 +130,6 @@ dmypy.json
 
 test*/
 checkpoints/*
+
+# Git worktrees
+.worktrees/
