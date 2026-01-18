@@ -1,0 +1,12 @@
+{
+  "undistort": {
+    "method": "anycalib",
+    "output_dir": "undistorted",
+    "intrinsics_path": "undistorted/intrinsics.json"
+  },
+  "reconstruction": {
+    "method": "vggtx",
+    "device": "cuda",
+    "output_dir": "reconstruction"
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "undistort": {
+    "method": "geocalib",
+    "output_dir": "undistorted",
+    "intrinsics_path": "undistorted/intrinsics.json"
+  },
+  "reconstruction": {
+    "method": "da3",
+    "device": "cuda",
+    "output_dir": "reconstruction"
+  }
+}

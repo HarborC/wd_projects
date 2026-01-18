@@ -1,61 +1,169 @@
+#!/usr/bin/env python3
+"""
+Multi-view Reconstruction Pipeline - CLI Entry Point
+
+A modular pipeline for multi-view image processing including undistortion
+and 3D reconstruction using various state-of-the-art methods.
+
+Usage:
+    # Using command line arguments
+    python pipeline.py --input-dir ./images --output-dir ./output --reconstruct-method hunyuanworld
+
+    # Using configuration file
+    python pipeline.py --input-dir ./images --output-dir ./output --config configs/hunyuanworld.json
+
+    # Skip undistortion (input already undistorted)
+    python pipeline.py --input-dir ./undistorted --output-dir ./output --skip-undistort
+"""
 import argparse
 import logging
 import sys
-import os
 from pathlib import Path
 
-from undistortion import GeoCalibUndistorter
-from reconstruction import Reconstructor
-from da3_reconstruction import DA3PostProcessor
-import numpy as np
-import cv2
-from PIL import Image
-
 # Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
-def run_pipeline(input_dir: str, output_dir: str, intrinsics_path: str, reconstruction_output_dir: str, method: str = "da3"):
-    """
-    Run the processing pipeline.
-    
-    Args:
-        input_dir (str): Path to input images.
-        output_dir (str): Path to save output images (undistorted).
-        intrinsics_path (str): Path to save intrinsics JSON.
-        reconstruction_output_dir (str): Path to save reconstruction results.
-        method (str): Reconstruction method ('da3' or 'mast3r').
-    """
-    # Step 1: Undistortion
-    logger.info("Starting Step 1: Image Undistortion")
-    try:
-        undistorter = GeoCalibUndistorter()
-        undistorter.process_directory(input_dir, output_dir, intrinsics_path)
-        logger.info("Step 1 completed successfully.")
-    except Exception as e:
-        logger.error(f"Step 1 failed: {e}")
-        return
+# Import Pipeline after logging is configured
+from pipeline import Pipeline
 
-    # Step 2: 3D Reconstruction
-    logger.info(f"Starting Step 2: 3D Reconstruction with {method}")
+
+def parse_args():
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(
+        description="Multi-view Reconstruction Pipeline",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+
+    # Input/output
+    parser.add_argument(
+        "--input-dir",
+        type=str,
+        required=True,
+        help="Input directory containing images"
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        required=True,
+        help="Output base directory"
+    )
+
+    # Undistortion configuration
+    parser.add_argument(
+        "--undistort-method",
+        type=str,
+        default="geocalib",
+        choices=["geocalib", "anycalib"],
+        help="Undistortion method"
+    )
+    parser.add_argument(
+        "--skip-undistort",
+        action="store_true",
+        help="Skip undistortion step (input images are already undistorted)"
+    )
+
+    # Reconstruction configuration
+    parser.add_argument(
+        "--reconstruct-method",
+        type=str,
+        default="da3",
+        choices=["da3", "mast3r", "hunyuanworld", "vggtx"],
+        help="Reconstruction method"
+    )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default=None,
+        help="Computation device (cuda/cpu). Auto-detect if not specified."
+    )
+
+    # Configuration file
+    parser.add_argument(
+        "--config",
+        type=str,
+        default=None,
+        help="Path to JSON configuration file (overrides command-line args)"
+    )
+
+    return parser.parse_args()
+
+
+def build_config_from_args(args) -> dict:
+    """Build configuration dictionary from command-line arguments."""
+    config = {}
+
+    if not args.skip_undistort:
+        config["undistort"] = {
+            "method": args.undistort_method,
+            "output_dir": "undistorted",
+            "intrinsics_path": "undistorted/intrinsics.json"
+        }
+
+    config["reconstruction"] = {
+        "method": args.reconstruct_method,
+        "device": args.device,
+        "output_dir": "reconstruction"
+    }
+
+    return config
+
+
+def main():
+    """Main entry point."""
+    args = parse_args()
+
+    # Validate input directory
+    input_dir = Path(args.input_dir)
+    if not input_dir.exists():
+        logger.error(f"Input directory does not exist: {args.input_dir}")
+        return 1
+
+    # Build configuration
+    if args.config:
+        logger.info(f"Loading configuration from: {args.config}")
+        pipeline = Pipeline.from_config_file(args.config)
+    else:
+        config = build_config_from_args(args)
+        pipeline = Pipeline(config)
+
+    # Print configuration
+    logger.info("")
+    logger.info("=" * 60)
+    logger.info("Pipeline Configuration")
+    logger.info("=" * 60)
+    logger.info(f"Input directory:  {args.input_dir}")
+    logger.info(f"Output directory: {args.output_dir}")
+    logger.info(f"Configured stages: {pipeline.list_stages()}")
+    logger.info("=" * 60)
+    logger.info("")
+
+    # Create output directory
+    Path(args.output_dir).mkdir(parents=True, exist_ok=True)
+
+    # Run pipeline
     try:
-        reconstructor = Reconstructor(method=method)
-        # Use the output of step 1 (undistorted images) as input for step 2
-        reconstructor.process_directory(output_dir, reconstruction_output_dir)
-        
-        logger.info("Step 2 completed successfully.")
+        outputs = pipeline.run(str(input_dir), args.output_dir)
+
+        # Print summary
+        logger.info("")
+        logger.info("=" * 60)
+        logger.info("Pipeline Summary")
+        logger.info("=" * 60)
+        for stage_name, output in outputs.items():
+            logger.info(f"{stage_name}: {output.output_dir}")
+        logger.info("=" * 60)
+
+        return 0
+
     except Exception as e:
-        logger.error(f"Step 2 failed: {e}")
-        return
+        logger.error(f"Pipeline execution failed: {e}")
+        logger.exception("Exception details:")
+        return 1
+
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Image Processing Pipeline")
-    parser.add_argument("--input_dir", type=str, default="/home/disk2/jiagangchen/LJ/process_data/first_frames", help="Input directory containing images")
-    parser.add_argument("--output_dir", type=str, default="/home/disk2/jiagangchen/wd_projects/test_data/undistorted_first_frames", help="Output directory for undistorted images")
-    parser.add_argument("--intrinsics_path", type=str, default="/home/disk2/jiagangchen/wd_projects/test_data/intrinsics_first_frames_geocalib.json", help="Path to save intrinsics JSON")
-    parser.add_argument("--reconstruction_output_dir", type=str, default="/home/disk2/jiagangchen/wd_projects/test_data/reconstruction_output", help="Output directory for reconstruction results")
-    parser.add_argument("--method", type=str, default="mast3r", choices=["da3", "mast3r"], help="Reconstruction method: 'da3', 'mast3r'")
-    
-    args = parser.parse_args()
-    
-    run_pipeline(args.input_dir, args.output_dir, args.intrinsics_path, args.reconstruction_output_dir, args.method)
+    sys.exit(main())
