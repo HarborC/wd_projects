@@ -23,3 +23,5 @@ python setup.py build_ext --inplace
 pip install submodules/simple-knn --no-build-isolation
 pip install submodules/diff-gaussian-rasterization --no-build-isolation
 pip install submodules/fused-ssim --no-build-isolation
+
+export CUDA_VISIBLE_DEVICES=2
