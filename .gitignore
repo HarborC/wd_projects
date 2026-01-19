@@ -133,3 +133,4 @@ checkpoints/*
 
 # Git worktrees
 .worktrees/
+.claude/

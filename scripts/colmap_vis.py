@@ -36,12 +36,17 @@ from viser.extras.colmap import (
     read_cameras_binary,
     read_images_binary,
     read_points3d_binary,
+    read_cameras_text,
+    read_images_text,
+    read_points3D_text,
 )
 
 
 def main(
-    colmap_path: Path = Path(__file__).parent / "../test_reconstruction_output/sparse/0",
-    images_path: Path = Path(__file__).parent / "../test_reconstruction_output/images",
+    # colmap_path: Path = Path(__file__).parent / "../test_reconstruction_output/sparse/0",
+    # images_path: Path = Path(__file__).parent / "../test_reconstruction_output/images",
+    colmap_path: Path = Path("/data/cjg/projects/wd_projects/.worktrees/pipeline-parallel-branches/test_instantsplat_output/source/sparse_6/0"),
+    images_path: Path = Path("/data/cjg/projects/wd_projects/.worktrees/pipeline-parallel-branches/test_instantsplat_output/source/images"),
     downsample_factor: int = 2,
     reorient_scene: bool = True,
 ) -> None:
@@ -56,9 +61,14 @@ def main(
     server.gui.configure_theme(titlebar_content=None, control_layout="collapsible")
 
     # Load the colmap info.
-    cameras = read_cameras_binary(colmap_path / "cameras.bin")
-    images = read_images_binary(colmap_path / "images.bin")
-    points3d = read_points3d_binary(colmap_path / "points3D.bin")
+    if (colmap_path / "cameras.bin").exists():
+        cameras = read_cameras_binary(colmap_path / "cameras.bin")
+        images = read_images_binary(colmap_path / "images.bin")
+        points3d = read_points3d_binary(colmap_path / "points3D.bin")
+    else:
+        cameras = read_cameras_text(colmap_path / "cameras.txt")
+        images = read_images_text(colmap_path / "images.txt")
+        points3d = read_points3D_text(colmap_path / "points3D.txt")
 
     points = np.array([points3d[p_id].xyz for p_id in points3d])
     colors = np.array([points3d[p_id].rgb for p_id in points3d])

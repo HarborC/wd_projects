@@ -153,7 +153,7 @@ class BaseUndistorter(ABC):
             undistorted_img = F.interpolate(
                 undistorted_img, 
                 size=(orig_h, orig_w), 
-                mode='bilinear', 
+                mode='bicubic', 
                 align_corners=False
             )
             

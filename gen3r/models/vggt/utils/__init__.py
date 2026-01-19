@@ -1,1 +1,0 @@
-"""VGGT utility functions."""

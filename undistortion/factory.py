@@ -228,7 +228,7 @@ def main():
     )
 
     parser = argparse.ArgumentParser(
-        description='Test AnyCalib undistortion using the factory pattern',
+        description='Test undistortion using the factory pattern',
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
 
@@ -245,10 +245,11 @@ def main():
         help='Directory to save undistorted images'
     )
     parser.add_argument(
-        '--intrinsics',
+        '--backend',
         type=str,
-        default=None,
-        help='Path to save intrinsics JSON file (optional)'
+        default='anycalib',
+        choices=['anycalib', 'geocalib'],
+        help='Backend to use for undistortion'
     )
     parser.add_argument(
         '--device',
@@ -256,28 +257,38 @@ def main():
         default=None,
         help='Device to use (cuda or cpu). Auto-detect if not specified.'
     )
+
+    # AnyCalib-specific arguments
     parser.add_argument(
         '--model-id',
         type=str,
         default='anycalib_gen',
-        help='AnyCalib model ID to use'
+        help='AnyCalib model ID to use (only for anycalib backend)'
     )
     parser.add_argument(
         '--camera-model',
         type=str,
         default='kb',
-        help='Camera model for calibration'
+        help='Camera model for calibration (only for anycalib backend)'
     )
     parser.add_argument(
         '--undistort-scale',
         type=float,
         default=-1.0,
-        help='Scale factor for undistortion. < 0 for adaptive, > 0 for fixed scale'
+        help='Scale factor for undistortion. < 0 for adaptive, > 0 for fixed scale (only for anycalib backend)'
     )
     parser.add_argument(
         '--center-principal-point',
         action='store_true',
-        help='Force principal point to image center'
+        help='Force principal point to image center (only for anycalib backend)'
+    )
+
+    # GeoCalib-specific arguments
+    parser.add_argument(
+        '--weights',
+        type=str,
+        default='distorted',
+        help='GeoCalib weights to load (only for geocalib backend)'
     )
 
     args = parser.parse_args()
@@ -292,34 +303,49 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     logger.info("=" * 80)
-    logger.info("Testing AnyCalib Undistortion via Factory Pattern")
+    logger.info(f"Testing {args.backend.upper()} Undistortion via Factory Pattern")
     logger.info("=" * 80)
     logger.info(f"Input directory:  {input_dir}")
     logger.info(f"Output directory: {output_dir}")
+    logger.info(f"Backend:          {args.backend}")
     logger.info(f"Device:           {args.device or 'auto-detect'}")
-    logger.info(f"Model ID:         {args.model_id}")
-    logger.info(f"Camera model:     {args.camera_model}")
-    logger.info(f"Undistort scale:  {args.undistort_scale} {'(adaptive)' if args.undistort_scale < 0 else '(fixed)'}")
-    logger.info(f"Center PP:        {args.center_principal_point}")
+
+    if args.backend == 'anycalib':
+        logger.info(f"Model ID:         {args.model_id}")
+        logger.info(f"Camera model:     {args.camera_model}")
+        logger.info(f"Undistort scale:  {args.undistort_scale} {'(adaptive)' if args.undistort_scale < 0 else '(fixed)'}")
+        logger.info(f"Center PP:        {args.center_principal_point}")
+    elif args.backend == 'geocalib':
+        logger.info(f"Weights:          {args.weights}")
+
     logger.info("=" * 80)
 
     try:
-        # Method 1: Using create_anycalib convenience method
-        logger.info("\n[Method 1] Creating undistorter using create_anycalib()...")
-        undistorter = UndistorterFactory.create_anycalib(
-            device=args.device,
-            model_id=args.model_id,
-            camera_model=args.camera_model,
-            undistort_scale=args.undistort_scale,
-            center_principal_point=args.center_principal_point
-        )
+        # Create undistorter based on selected backend
+        logger.info(f"\nCreating undistorter using {args.backend} backend...")
+        if args.backend == 'anycalib':
+            undistorter = UndistorterFactory.create_anycalib(
+                device=args.device,
+                model_id=args.model_id,
+                camera_model=args.camera_model,
+                undistort_scale=args.undistort_scale,
+                center_principal_point=args.center_principal_point
+            )
+        elif args.backend == 'geocalib':
+            undistorter = UndistorterFactory.create_geocalib(
+                device=args.device,
+                weights=args.weights
+            )
+        else:
+            raise ValueError(f"Unknown backend: {args.backend}")
 
         # Process images
         logger.info("\nProcessing images...")
+        intrinsics_path = output_dir / 'intrinsics.json'
         results = undistorter.process_directory(
             input_dir=input_dir,
             output_dir=output_dir,
-            intrinsics_output_path=args.intrinsics
+            intrinsics_output_path=intrinsics_path
         )
 
         # Summary
@@ -331,10 +357,7 @@ def main():
         logger.info(f"Total images:     {len(results)}")
         logger.info(f"Successful:       {successful}")
         logger.info(f"Failed:           {failed}")
-
-        if args.intrinsics:
-            logger.info(f"Intrinsics saved: {args.intrinsics}")
-
+        logger.info(f"Intrinsics saved: {intrinsics_path}")
         logger.info("=" * 80)
 
         # Show first result as example
@@ -363,10 +386,20 @@ if __name__ == '__main__':
     sys.exit(main())
 
 """
-export CUDA_VISIBLE_DEVICES=1 
+# AnyCalib backend (default)
+export CUDA_VISIBLE_DEVICES=1
 python -m undistortion.factory \
-    --input-dir ./data/data1 \
+    --input-dir ./data/weidian-1 \
     --output-dir ./test_undistort_output \
-    --intrinsics ./test_undistort_output/intrinsics.json \
+    --backend anycalib \
+    --device cuda
+
+# GeoCalib backend
+export CUDA_VISIBLE_DEVICES=1
+python -m undistortion.factory \
+    --input-dir ./data/weidian-1 \
+    --output-dir ./test_undistort_output2 \
+    --backend geocalib \
+    --weights distorted \
     --device cuda
 """

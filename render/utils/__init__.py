@@ -1,1 +1,0 @@
-"""InstantSplat utility functions."""

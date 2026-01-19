@@ -41,34 +41,30 @@ class GeoCalibUndistorter(BaseUndistorter):
     def _load_model(self):
         """Load the GeoCalib model."""
         # Add GeoCalib to path
-        geocalib_path = Path(__file__).parent.parent / "GeoCalib"
+        geocalib_path = Path(__file__).parent / "GeoCalib"
         if geocalib_path.exists() and str(geocalib_path) not in sys.path:
             sys.path.append(str(geocalib_path))
 
         logger.info(f"Initializing GeoCalib backend on {self.device} with weights='{self.weights}'")
 
-        try:
-            from geocalib import GeoCalib
-            self.model = GeoCalib(weights=self.weights).to(self.device)
-            self.model.eval()
-        except Exception as e:
-            logger.error(f"Failed to load GeoCalib model: {e}")
-            raise
+        from geocalib import GeoCalib
+        self.model = GeoCalib(weights=self.weights).to(self.device)
+        self.model.eval()
 
     def _calibrate(self, image: torch.Tensor) -> Dict:
         """
         Calibrate a single image using GeoCalib.
 
         Args:
-            image (torch.Tensor): Input image tensor [C, H, W].
+            image (torch.Tensor): Input image tensor [C, H, W] in range [0, 1], RGB format.
 
         Returns:
             Dict: Calibration results containing 'camera' and 'gravity' objects.
         """
         with torch.no_grad():
-            # Load and calibrate
-            image_batch = self.model.load_image_tensor(image).to(self.device)
-            res = self.model.calibrate(image_batch, camera_model="simple_divisional")
+            # GeoCalib's calibrate() expects image in [0, 1] range and RGB format
+            # It handles adding batch dimension internally
+            res = self.model.calibrate(image, camera_model="simple_divisional")
 
         return res
 

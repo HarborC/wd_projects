@@ -1,1 +1,0 @@
-"""InstantSplat scene management."""

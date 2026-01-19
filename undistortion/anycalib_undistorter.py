@@ -240,7 +240,7 @@ class AnyCalibUndistorter(BaseUndistorter):
         params: torch.Tensor,
         scale: float = 1.0,
         outside_value: float = 0.0,
-        interp_mode: str = "bilinear"
+        interp_mode: str = "bicubic"
     ) -> torch.Tensor:
         """
         Custom undistortion that forces principal point to image center.
