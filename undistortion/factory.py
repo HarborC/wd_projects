@@ -305,10 +305,10 @@ def main():
     logger.info("=" * 80)
     logger.info(f"Testing {args.backend.upper()} Undistortion via Factory Pattern")
     logger.info("=" * 80)
-    logger.info(f"Input directory:  {input_dir}")
-    logger.info(f"Output directory: {output_dir}")
-    logger.info(f"Backend:          {args.backend}")
-    logger.info(f"Device:           {args.device or 'auto-detect'}")
+    logger.info(f"Input directory:   {input_dir}")
+    logger.info(f"Output directory:  {output_dir}")
+    logger.info(f"Backend:           {args.backend}")
+    logger.info(f"Device:            {args.device or 'auto-detect'}")
 
     if args.backend == 'anycalib':
         logger.info(f"Model ID:         {args.model_id}")

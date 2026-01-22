@@ -346,6 +346,6 @@ if __name__ == '__main__':
 python -m reconstruction.factory \
     --input-dir ./test_undistort_output \
     --output-dir ./test_reconstruction_output \
-    --backend hunyuanworld \
+    --backend mast3r \
     --device cuda
 """
