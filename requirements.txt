@@ -12,7 +12,6 @@ trimesh
 roma
 open3d
 einops
-gradio
 matplotlib
 tqdm
 opencv-python
@@ -38,13 +37,11 @@ transformers==4.38.0
 diffusers==0.26.0
 accelerate
 peft==0.9.0
-git+https://github.com/facebookresearch/pytorch3d.git
 kornia
 open-clip-torch==2.17.1
 colorama
 splines
 av
-gradio==6.2.0
 fire
 evo
 pyglet==1.5.31

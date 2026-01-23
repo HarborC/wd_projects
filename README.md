@@ -1,109 +1,71 @@
-# 3D Vision Pipeline
+# WD Projects: 3D 场景重建与生成工具箱
 
-A comprehensive 3D computer vision pipeline that combines image processing, 3D reconstruction, and novel view synthesis. This modular system enables end-to-end processing from distorted input images to rendered 3D scenes.
+这是一个集成了多种前沿 3D 视觉算法的综合工程，涵盖了从图像去畸变、多视角几何重建、BEV（鸟瞰图）生成到新视角合成（View Synthesis）的全流程工具链。
 
-## Overview
+## 📋 功能模块
 
-This project provides a complete pipeline for:
-1. **Image Undistortion** - Camera calibration and lens distortion correction
-2. **3D Reconstruction** - Multiple state-of-the-art backends for scene geometry
-3. **Gaussian Splatting** - High-quality real-time rendering
-4. **Novel View Synthesis** - Generate new camera views using diffusion models
+本项目主要包含以下核心模块：
 
-## Project Structure
+### 1. 图像去畸变 (Undistortion)
+提供基于学习的相机标定与去畸变功能，支持野外（In-the-wild）图像的预处理。
+- **支持算法**:
+  - `geocalib`: 基于 GeoCalib 的自动标定。
+  - `anycalib`: 通用标定工具。
 
-```
-wd_projects/
-├── pipeline.py                    # Main workflow orchestrator
-├── undistortion/                  # Camera calibration & undistortion
-│   ├── geocalib_undistorter.py
-│   ├── anycalib_undistorter.py
-│   └── ...
-├── reconstruction/                # 3D reconstruction engines
-│   ├── factory.py                 # Backend factory
-│   ├── base_reconstructor.py      # Abstract base class
-│   ├── da3_reconstructor.py       # Depth Anything 3
-│   ├── mast3r_reconstructor.py    # MASt3R multi-view stereo
-│   ├── hunyuanworld_reconstructor.py  # HunyuanWorld Mirror
-│   ├── depth_anything_3/          # DA3 implementation
-│   ├── mast3r/                    # MASt3R implementation
-│   └── HunyuanWorld-Mirror/       # HunyuanWorld implementation
-├── render/                        # Gaussian Splatting pipeline
-│   ├── pipeline_difix.py
-│   ├── simple_deblur_difix.py
-│   ├── scoring_model.py
-│   ├── bad_gaussians/             # 3DGS implementation
-│   └── pyproject.toml
-├── recon_to_seva_converter.py     # COLMAP to SEVA converter
-├── test_code/                     # Demo implementations
-│   ├── stable-virtual-camera/     # SEVA diffusion model
-│   └── InstantSplat/              # Sparse-view 3DGS
-├── requirements.txt
-└── RECON_TO_SEVA_README.md
-```
+### 2. 3D 场景重建 (Reconstruction)
+集成了多种 SOTA 重建算法，用于从图像序列恢复稀疏点云、相机位姿和深度图。
+- **支持算法**:
+  - `mast3r`: 基于 MASt3R 的稠密匹配与重建。
+  - `da3`: 集成 Depth Anything V3 的重建流程。
+  - `hunyuanworld`: HunyuanWorld 重建器。
+  - `vggt`: VGGT 重建器。
 
-## Features
+### 3. BEV 生成 (Bird's Eye View)
+基于几何反投影与重力对齐算法，将重建场景转换为标准的正交俯视图。
+- **核心功能**:
+  - 自动地平面检测与重力对齐。
+  - 基于 DSM (Digital Surface Model) 的遮挡处理与纹理映射。
+  - 生成 `scene_metadata.npz` 用于后续任务。
 
-### Multi-Backend Support
+### 4. 视图合成 (Crafter / ViewCrafter)
+基于 ViewCrafter 的视频生成与新视角合成管线，支持从稀疏视角生成连贯的漫游视频。
+- **特点**:
+  - **直接支持 COLMAP**: 无需中间转换，直接读取 `sparse/` 和 `depths/` 文件夹。
+  - **显存优化**: 针对 H100 等硬件进行了大分辨率渲染优化。
+  - **去 Dust3r 依赖**: 纯净的推理管线，减少环境依赖。
 
-Choose from state-of-the-art 3D reconstruction methods:
+### 5. 3D Gaussian Splatting
+集成 3DGS 训练与渲染管线，用于高质量的实进渲染。
 
-| Backend | Description |
-|---------|-------------|
-| **DA3** | Depth Anything 3 - Deep learning-based depth estimation |
-| **MASt3R** | Multi-view stereo with attention mechanisms |
-| **HunyuanWorld** | Tencent's Mirror 3D reconstruction model |
+---
 
-### Pipeline Workflow
+## 🛠️ 环境安装
 
-1. **Undistortion**: Correct lens distortion and extract camera intrinsics
-2. **Reconstruction**: Generate 3D scene geometry
-3. **Conversion**: Transform outputs to various formats (COLMAP, SEVA)
-4. **Rendering**: Gaussian Splatting for novel view synthesis
-
-## Installation
+本项目推荐使用 `micromamba` 或 `conda` 进行环境管理。
 
 ```bash
+# 创建并激活环境 (以 micromamba 为例)
+micromamba create -n wd python=3.10
+micromamba activate wd
+
+pip install torch==2.7.0 torchvision==0.22.0 torchaudio==2.7.0 --index-url https://download.pytorch.org/whl/cu128
 pip install -r requirements.txt
+pip install --no-build-isolation "git+https://github.com/facebookresearch/pytorch3d.git"
+pip install gradio==6.2.0
+pip install huggingface-hub[torch]==0.23.5
 ```
 
-### Key Dependencies
+## 📂 目录结构说明
 
-- PyTorch
-- OpenCV
-- COLMAP
-- Diffusers (for SEVA)
-
-## Usage
-
-### Basic Pipeline
-
-```python
-from pipeline import Pipeline
-
-# Initialize pipeline with desired backend
-pipeline = Pipeline(
-    undistorter="geocalib",
-    reconstructor="da3"  # or "mast3r", "hunyuanworld"
-)
-
-# Run pipeline
-pipeline.run(input_images, output_dir)
+```text
+wd_projects/
+├── bev/                # BEV 生成核心代码
+├── checkpoints/        # 模型权重存放路径
+├── crafter/            # ViewCrafter 视图合成模块 (Refactored)
+├── data/               # 数据存放目录
+├── gaussians/          # 3D Gaussian Splatting 模块
+├── reconstruction/     # 多种重建算法的统一接口
+├── undistortion/       # 图像去畸变模块
+├── scripts/            # 实用脚本工具
+└── requirements.txt    # 项目依赖
 ```
-
-### Reconstruction to SEVA
-
-```bash
-python recon_to_seva_converter.py \
-    --colmap_dir /path/to/colmap \
-    --output_dir /path/to/seva \
-    --target_views 32
-```
-
-## Documentation
-
-- [RECON_TO_SEVA_README.md](RECON_TO_SEVA_README.md) - Detailed SEVA conversion guide
-
-## License
-
-This project integrates multiple research implementations. Please refer to individual submodules for their specific licenses.
