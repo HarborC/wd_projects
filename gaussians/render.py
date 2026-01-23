@@ -318,7 +318,70 @@ def render_sets(
 
         # 3. 遍历每一张渲染图，寻找最近邻的参考图
         # viewpoint_stack 是渲染用的插值相机列表
-        for idx, render_cam in enumerate(tqdm(viewpoint_stack, desc="Matching pairs")):
+        
+        # [Modify] 限制生成的样本对数量，只取约 10 帧进行修复测试
+        TARGET_FIX_COUNT = 10
+        total_frames = len(viewpoint_stack)
+        
+        # 1. 计算每一帧到最近训练相机的距离
+        frame_min_dists = []
+        for idx in range(total_frames):
+            render_cam = viewpoint_stack[idx]
+            r_R_wc = render_cam.R.T
+            r_center = -np.dot(r_R_wc, render_cam.T)
+            
+            min_train_dist = 1e9
+            for t_info in train_cam_infos_cache:
+                # Euclidean distance
+                dist = np.linalg.norm(r_center - t_info['center'])
+                if dist < min_train_dist:
+                    min_train_dist = dist
+            frame_min_dists.append(min_train_dist)
+            
+        # [Modify] 3. 分层最大距离采样 (Stratified Max-Distance Sampling)
+        # 将时间轴划分为N个区间，在每个区间内选择"距离训练集最远"的那一帧。
+        # 优势: 1. 绝对的均匀覆盖 (解决了扎堆问题，如49,50,51)
+        #       2. 选出局部最难帧 (解决了均匀采样可能选到简单帧的问题)
+        
+        indices_to_process = []
+        
+        # 动态计算分段大小
+        segment_size = total_frames / TARGET_FIX_COUNT
+        print(f"[Info] 采用分层最大距离采样: 将 {total_frames} 帧分为 {TARGET_FIX_COUNT} 段，每段约 {segment_size:.1f} 帧。")
+        
+        for i in range(TARGET_FIX_COUNT):
+            # 定义当前分段的起始和结束索引 (时间轴上的连续片段)
+            start_idx = int(i * segment_size)
+            end_idx = int((i + 1) * segment_size)
+            
+            # 最后一个分段确保覆盖到结尾
+            if i == TARGET_FIX_COUNT - 1:
+                end_idx = total_frames
+                
+            # 获取该段内的所有帧的最短距离
+            segment_dists = frame_min_dists[start_idx:end_idx]
+            
+            if len(segment_dists) == 0:
+                continue
+                
+            # 找到该段内距离最大的帧的局部索引
+            local_max_idx = np.argmax(segment_dists)
+            global_idx = start_idx + local_max_idx
+            
+            # 这里我们不直接过滤 < 0.05 的帧，因为如果整段都不满足，我们依然要选一个最好的
+            # 否则就会导致采样的帧数不足 20 帧，影响最终视频的连贯性修复
+            indices_to_process.append(global_idx)
+
+        # 重新排序回时间轴顺序
+        indices_to_process = sorted([int(x) for x in indices_to_process])
+        print(f"[Info] 分层采样完成: 已选 {len(indices_to_process)} 帧。")
+        
+        # Filter掉太近的 (Double check, although peaks should handle it)
+        # 如果所有峰值都很小(甚至<0.01)，说明轨迹本身就贴着训练集，那还是得修
+        
+        for idx in tqdm(indices_to_process, desc=f"Matching pairs ({len(indices_to_process)} frames)"):
+            render_cam = viewpoint_stack[idx]
+            
             # 渲染图路径 (Input)
             render_img_name = f"{idx:05d}.png"
             render_img_path = os.path.join(image_folder, render_img_name)
@@ -336,7 +399,9 @@ def render_sets(
             
             # 策略: 
             # 1. 过滤掉角度差异过大 (>60度, cos_sim < 0.5) 的
-            # 2. 在剩下的里面找距离最近的
+            # 2. 在剩下的里面找距离最近的 Top-K
+            # [Modify] 回退到 1-对-1 模式 (User feedback: 1-to-many is problematic)
+            TOP_K = 1
             
             # Step 1: Filter by angle
             candidates = []
@@ -346,16 +411,18 @@ def render_sets(
                 if cos_sim > 0.5: # > 60 degree View Cone
                     candidates.append(t_info)
             
-            # Fallback: 如果没有角度合适的，就全部作为候选（选角度最小的）
-            if not candidates:
-                 # Find max cos_sim
-                 best_cam = max(train_cam_infos_cache, key=lambda x: np.dot(r_view_dir, x['view_dir']))['cam']
-            else:
-                 # Step 2: Find closest distance
-                 best_candidate = min(candidates, key=lambda x: np.linalg.norm(r_center - x['center']))
-                 best_cam = best_candidate['cam']
+            # Filtered candidates
+            valid_candidates = candidates if candidates else train_cam_infos_cache
             
-            if best_cam and best_cam.uid in train_cam_paths:
+            # Step 2: Sort by distance
+            # x['center'] is world position
+            valid_candidates.sort(key=lambda x: np.linalg.norm(r_center - x['center']))
+            
+            # Select Top K
+            selected_cams = [x['cam'] for x in valid_candidates[:TOP_K]]
+            
+            # 创建可以保存多张参考图的子目录结构
+            if selected_cams:
                 # 创建子目录
                 sub_dir = os.path.join(fix_pairs_dir, f"{idx:05d}")
                 os.makedirs(sub_dir, exist_ok=True)
@@ -366,15 +433,19 @@ def render_sets(
                     os.remove(target_input)
                 os.symlink(os.path.abspath(render_img_path), target_input)
                 
-                # 创建软链接: Reference (原始图)
-                src_ref = train_cam_paths[best_cam.uid]
-                ext = os.path.splitext(src_ref)[1]
-                target_ref = os.path.join(sub_dir, f"ref{ext}") # 保持原后缀
-                if os.path.exists(target_ref):
-                    os.remove(target_ref)
-                os.symlink(os.path.abspath(src_ref), target_ref)
+                # 创建软链接: Reference (Single Best)
+                # 只保存一个 ref.jpg，方便下游处理
+                cam = selected_cams[0]
+                if cam.uid in train_cam_paths:
+                    src_ref = train_cam_paths[cam.uid]
+                    ext = os.path.splitext(src_ref)[1]
+                    # 统一命名为 ref.ext
+                    target_ref = os.path.join(sub_dir, f"ref{ext}") 
+                    if os.path.exists(target_ref):
+                        os.remove(target_ref)
+                    os.symlink(os.path.abspath(src_ref), target_ref)
         
-        print(f"[Info] 样本对已生成至: {fix_pairs_dir}")
+        print(f"[Info] 样本对已生成至: {fix_pairs_dir} (Best-1 Reference)")
 
 
 
