@@ -705,7 +705,8 @@ class BevReconstructor:
         np.savez(metadata_path,
                 intrinsics=intrinsics_final,            
                 extrinsics=extrinsics_aligned,   # Aligned World -> Camera
-                depth_paths=np.array(saved_depth_paths), 
+                depth_paths=np.array(saved_depth_paths),
+                img_paths=np.array(valid_img_paths if 'valid_img_paths' in locals() else img_paths), # Handle var name difference
                 bev_params=bev_params_full       # [x_min, z_max, res, ground, w, h] - Sufficient for World <-> BEV
                 )
         print(f"Scene metadata saved to {metadata_path}")

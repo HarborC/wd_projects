@@ -53,7 +53,7 @@ class MASt3RReconstructor(BaseReconstructor):
         from mast3r.model import AsymmetricMASt3R
 
         if not Path(self.model_name).exists():
-            os.system('mkdir -p mast3r && wget https://download.europe.naverlabs.com/ComputerVision/MASt3R/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth -P checkpoints/')
+            os.system('mkdir -p checkpoints && wget https://download.europe.naverlabs.com/ComputerVision/MASt3R/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth -P checkpoints/')
 
         logger.info(f"Loading MASt3R model from: {self.model_name}")
         self.model = AsymmetricMASt3R.from_pretrained(self.model_name).to(self.device)
