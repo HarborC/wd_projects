@@ -3,7 +3,7 @@ import torch
 import numpy as np
 from pathlib import Path
 from PIL import Image
-from depth_anything_3.api import DepthAnything3
+import pycolmap
 import cv2
 from transformers import SegformerImageProcessor, SegformerForSemanticSegmentation
 
@@ -65,83 +65,111 @@ def get_ground_masks(img_paths):
         print(f"Warning: Failed to load SegFormer or detect ground ({e}). Falling back to geometric alignment.")
         return None
 
-def load_data(undistorted_dir: Path, intrinsics_path: Path):
-    # Load intrinsics
-    with open(intrinsics_path, 'r') as f:
-        intrinsics_data = json.load(f)
-
-    # Find undistorted images
-    img_paths = sorted([p for p in undistorted_dir.iterdir() if p.suffix.lower() in ('.jpg', '.jpeg', '.png')])
-    if not img_paths:
-        print(f"No images found in {undistorted_dir}")
-        return [], []
-
-    # Map original paths to undistorted paths (assuming stem matches + _undistorted)
-    stem_to_intrinsics = {}
-    for path_str, data in intrinsics_data.items():
-        p = Path(path_str)
-        stem_to_intrinsics[p.stem] = data
-
-    # Prepare inputs for DA3
-    valid_img_paths = []
-    valid_intrinsics = []
-    
-    for p in img_paths:
-        original_stem = p.stem.replace('_undistorted', '')
+def load_reconstruction_data(reconstruction_dir: Path):
+    """
+    Load data from a reconstruction directory (COLMAP format + depths).
+    EXPECTING:
+      - reconstruction_dir/sparse/0/ (COLMAP model)
+      - reconstruction_dir/images/ (Images)
+      - reconstruction_dir/depths/ (Depth maps as .npy)
+      - reconstruction_dir/depths/ (Optional: Confidence maps as _conf.npy)
+    """
+    sparse_dir = reconstruction_dir / "sparse" / "0"
+    if not sparse_dir.exists():
+        # Try without '0'
+        sparse_dir = reconstruction_dir / "sparse"
         
-        if original_stem in stem_to_intrinsics:
-            data = stem_to_intrinsics[original_stem]
-            if 'camera' in data and data['camera'] is not None and 'K' in data['camera']:
-                K = np.array(data['camera']['K'][0]) 
-                valid_img_paths.append(str(p))
-                valid_intrinsics.append(K)
-            else:
-                print(f"Warning: No camera intrinsics for {original_stem}")
-        else:
-            print(f"Warning: Could not find intrinsics for {p.name} (derived stem: {original_stem})")
+    if not sparse_dir.exists():
+        raise FileNotFoundError(f"Could not find COLMAP sparse directory at {sparse_dir}")
+        
+    print(f"Loading reconstruction from {sparse_dir}...")
+    recon = pycolmap.Reconstruction(sparse_dir)
+    
+    images_dir = reconstruction_dir / "images"
+    depths_dir = reconstruction_dir / "depths"
+    
+    img_paths = []
+    intrinsics = []
+    extrinsics_w2c = []
+    depths = []
+    confs = []
+    images_u8 = []
+    
+    # Sort images by name
+    sorted_images = sorted(recon.images.values(), key=lambda x: x.name)
+    
+    for img in sorted_images:
+        # 1. Image Path
+        img_p = images_dir / img.name
+        if not img_p.exists():
+            print(f"Warning: Image {img_p} not found, skipping.")
+            continue
             
-    return valid_img_paths, valid_intrinsics
+        # 2. Depth Path
+        # Assuming stem matches and extension is .npy
+        stem = Path(img.name).stem
+        depth_p = depths_dir / f"{stem}.npy"
+        if not depth_p.exists():
+            print(f"Warning: Depth {depth_p} not found, skipping.")
+            continue
+            
+        # 3. Confidence Path (Optional)
+        conf_p = depths_dir / f"{stem}_conf.npy"
+        
+        # Load Image
+        pil_img = Image.open(img_p).convert("RGB")
+        img_np = np.array(pil_img)
+        
+        # Load Depth
+        depth = np.load(depth_p)
+        
+        # Resize depth if needed
+        if depth.shape[:2] != img_np.shape[:2]:
+            depth = cv2.resize(depth, (img_np.shape[1], img_np.shape[0]), interpolation=cv2.INTER_NEAREST)
+            
+        # Load Confidence
+        conf = None
+        if conf_p.exists():
+            conf = np.load(conf_p)
+            if conf.shape[:2] != img_np.shape[:2]:
+                conf = cv2.resize(conf, (img_np.shape[1], img_np.shape[0]), interpolation=cv2.INTER_NEAREST)
+        
+        # Intrinsics
+        cam = recon.cameras[img.camera_id]
+        K = cam.calibration_matrix()
+        
+        # Extrinsics (World to Camera)
+        # COLMAP stores CamFromWorld (R, t)
+        # We need 4x4 matrix
+        w2c = np.eye(4)
+        
+        # Handle version differences where cam_from_world might be a method or property
+        if callable(img.cam_from_world):
+            cam_from_world = img.cam_from_world()
+        else:
+            cam_from_world = img.cam_from_world
 
-def run_inference(valid_img_paths, valid_intrinsics, output_dir):
-    # Initialize Depth Anything 3
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    print(f"Initializing DepthAnything3 (da3nested-giant-large) on {device}...")
-    model = DepthAnything3.from_pretrained("depth-anything/DA3NESTED-GIANT-LARGE")
-    model = model.eval()
-    model = model.to(device=device)
-
-    # Run inference
-    intrinsics_np = np.stack(valid_intrinsics)
+        w2c[:3, :3] = cam_from_world.rotation.matrix()
+        w2c[:3, 3] = cam_from_world.translation
+        
+        img_paths.append(str(img_p))
+        intrinsics.append(K)
+        extrinsics_w2c.append(w2c)
+        depths.append(depth)
+        images_u8.append(img_np)
+        confs.append(conf)
+        
+    print(f"Loaded {len(img_paths)} frames from reconstruction.")
     
-    print("Running inference...")
-    prediction = model.inference(
-        image=valid_img_paths,
-        # intrinsics=intrinsics_np,
-        export_dir=str(output_dir),
-        export_format="npz-glb-gs_ply-gs_video", 
-        # align_to_input_ext_scale=True, 
-        show_cameras=True,
-        infer_gs=True
-    )
-    print(f"Inference complete. Results saved to {output_dir}")
-    return prediction
+    # If any conf is None, we might return None for all confs to be safe, 
+    # or handle mixed. For now assuming either all have it or none.
+    if all(c is None for c in confs):
+        confs = None
+        
+    return img_paths, intrinsics, extrinsics_w2c, depths, images_u8, confs
 
-def calculate_conf_thresh(conf):
-    conf_thresh = 0.0
-    if conf is not None:
-        # print("Calculating confidence threshold...")
-        # # Default values from glb.py
-        # base_conf_thresh = 1.05
-        # conf_thresh_percentile = 20.0
-        # ensure_thresh_percentile = 90.0
-        
-        # lower = np.percentile(conf, conf_thresh_percentile)
-        # upper = np.percentile(conf, ensure_thresh_percentile)
-        # conf_thresh = min(max(base_conf_thresh, lower), upper)
-        conf_thresh = np.percentile(conf, 1.0)
-        print(f"Confidence threshold: {conf_thresh:.4f}")
-        
-    return conf_thresh
+
+
 
 def generate_point_cloud(depths, intrinsics, extrinsics_w2c, images_u8, conf, conf_thresh, ground_masks=None):
     all_points_world = []
@@ -295,13 +323,20 @@ def align_gravity(all_points_world, all_colors, ground_points_world, output_dir)
     
     return all_points_world, R_align
 
-def compute_bev_bounds(all_points_world, res=0.01, padding=5.0):
+def compute_bev_bounds(all_points_world, res=0.01, padding=None):
     x_vals = all_points_world[:, 0]
     z_vals = all_points_world[:, 2]
     
     # Use percentiles to ignore outliers
     x_min, x_max = np.percentile(x_vals, [1, 99])
     z_min, z_max = np.percentile(z_vals, [1, 99])
+    
+    if padding is None:
+        # Default adaptive padding: 10% of the largest dimension
+        width = x_max - x_min
+        height = z_max - z_min
+        padding = max(width, height) * 0.1
+        print(f"Adaptive padding set to: {padding:.4f}")
     
     x_min -= padding
     x_max += padding
@@ -516,41 +551,43 @@ def generate_bev_image(dsm_grid_filled, valid_dsm_mask, has_data_mask, x_min, z_
         
     return global_bev_img, final_diag
 
-class DA3PostProcessor:
+class BevReconstructor:
     def __init__(self):
         pass
 
-    def run(self, undistorted_dir: Path, intrinsics_path: Path, output_dir: Path):
+    def run(self, reconstruction_dir: Path, output_dir: Path, resolution: float = 0.01, target_size: int = None):
         output_dir.mkdir(parents=True, exist_ok=True)
 
         # 1. Load Data
-        valid_img_paths, valid_intrinsics = load_data(undistorted_dir, intrinsics_path)
-        if not valid_img_paths:
+        img_paths, intrinsics, extrinsics_w2c, depths, images_u8, confs = load_reconstruction_data(reconstruction_dir)
+        if not img_paths:
+            print("No data loaded.")
             return
-        print(f"Found {len(valid_img_paths)} images with intrinsics.")
 
-        # 2. Run Inference
-        prediction = run_inference(valid_img_paths, valid_intrinsics, output_dir)
-        
         # 3. Generate BEV
         print("Generating Merged BEV image (World Coordinate System)...")
         bev_dir = output_dir / "bev_images"
         bev_dir.mkdir(exist_ok=True)
         
-        depths = prediction.depth
-        intrinsics = prediction.intrinsics
-        extrinsics_w2c = prediction.extrinsics
-        conf = prediction.conf
-        images_u8 = prediction.processed_images
-
         # 4. Calculate Confidence Threshold
-        conf_thresh = calculate_conf_thresh(conf)
+        conf_thresh = 0.0
+        if confs is not None and len(confs) > 0 and confs[0] is not None:
+             # Sample for speed? Or just concat all?
+             # Concat might be big. Let's sample.
+             sample_size = max(1, len(confs)//10)
+             sample_confs = [c.flatten() for c in confs[::sample_size] if c is not None]
+             if sample_confs:
+                 all_conf = np.concatenate(sample_confs)
+                 conf_thresh = np.percentile(all_conf, 1.0)
+                 print(f"Confidence threshold (1st percentile of sample): {conf_thresh:.4f}")
         
         # 4.5 Detect Ground Masks
-        ground_masks = get_ground_masks(valid_img_paths)
+        ground_masks = get_ground_masks(img_paths)
         
         # 5. Generate Point Cloud
-        all_points_world, all_colors, ground_points_world = generate_point_cloud(depths, intrinsics, extrinsics_w2c, images_u8, conf, conf_thresh, ground_masks)
+        all_points_world, all_colors, ground_points_world = generate_point_cloud(
+            depths, intrinsics, extrinsics_w2c, images_u8, confs, conf_thresh, ground_masks)
+        
         if all_points_world is None:
             print("No valid points found.")
             return
@@ -579,8 +616,34 @@ class DA3PostProcessor:
         all_points_world, R_align = align_gravity(all_points_world, all_colors, ground_points_world, output_dir)
         
         # 7. Compute BEV Bounds
-        res = 0.01 # 1cm per pixel
-        x_min, z_max, bev_w, bev_h = compute_bev_bounds(all_points_world, res=res)
+        # res = 0.01 # 1cm per pixel
+        
+        # Calculate bounds first to determine resolution if needed
+        x_vals = all_points_world[:, 0]
+        z_vals = all_points_world[:, 2]
+        x_min_raw, x_max_raw = np.percentile(x_vals, [1, 99])
+        z_min_raw, z_max_raw = np.percentile(z_vals, [1, 99])
+        scene_width = x_max_raw - x_min_raw
+        scene_height = z_max_raw - z_min_raw
+        
+        print(f"Scene raw dimensions: Width={scene_width:.4f}, Height={scene_height:.4f}")
+
+        if target_size is not None and target_size > 0:
+            # Auto-calculate resolution to fit target size (max dimension)
+            max_dim = max(scene_width, scene_height)
+            if max_dim > 0:
+                # We want margin, so let's say target size covers the content loosely
+                # effective_res = max_dim / (target_size * 0.8) # Allow some padding
+                res = max_dim / target_size
+                print(f"Auto-calculated resolution: {res:.6f} to fit target size {target_size}")
+            else:
+                res = resolution
+                print(f"Warning: Scene size is zero, using provided resolution: {res}")
+        else:
+            res = resolution
+
+        # Use None to trigger adaptive padding inside the function
+        x_min, z_max, bev_w, bev_h = compute_bev_bounds(all_points_world, res=res, padding=None)
         
         # 8. Generate DSM
         dsm_grid_filled, valid_dsm_mask, has_data_mask, ground_level = generate_dsm(all_points_world, x_min, z_max, res, bev_w, bev_h)
@@ -600,56 +663,26 @@ class DA3PostProcessor:
         print(f"Diagnostic mask saved to {diag_path}")
 
         # 10. Save Depth Maps at Original Resolution
-        print("Processing and saving depth maps at original resolution...")
+        print("Processing and saving metadata...")
         depths_dir = output_dir / "depths_original_res"
         depths_dir.mkdir(exist_ok=True)
         
         saved_depth_paths = []
         original_shapes = []
-        intrinsics_estimated_scaled = []
         
-        for i, (depth, img_path) in enumerate(zip(depths, valid_img_paths)):
-            # Get original size
-            with Image.open(img_path) as img:
-                W_orig, H_orig = img.size
-                
-            original_shapes.append([H_orig, W_orig])
+        # Save depths
+        for i, (depth, img_path) in enumerate(zip(depths, img_paths)):
+            img_shape = images_u8[i].shape[:2] # H, W
+            original_shapes.append([img_shape[0], img_shape[1]])
             
-            # Resize depth if needed
-            H_pred, W_pred = depth.shape
-            if (H_pred, W_pred) != (H_orig, W_orig):
-                depth_resized = cv2.resize(depth, (W_orig, H_orig), interpolation=cv2.INTER_LINEAR)
-            else:
-                depth_resized = depth
-                
-            # Save as .npy
             save_path = depths_dir / f"{Path(img_path).stem}.npy"
-            np.save(save_path, depth_resized)
+            np.save(save_path, depth)
             saved_depth_paths.append(str(save_path))
-            
-            # Scale estimated intrinsics (from prediction) to original resolution
-            K_est = intrinsics[i]
-            sx = W_orig / W_pred
-            sy = H_orig / H_pred
-            
-            K_scaled = K_est.copy()
-            K_scaled[0, 0] *= sx
-            K_scaled[1, 1] *= sy
-            K_scaled[0, 2] *= sx
-            K_scaled[1, 2] *= sy
-            intrinsics_estimated_scaled.append(K_scaled)
-            
-        print(f"Saved {len(saved_depth_paths)} depth maps to {depths_dir}")
 
-        # 11. Save Metadata for Trajectory Tracking
-        print("Saving metadata for trajectory tracking...")
+        # 11. Save Metadata 
+        print("Saving metadata...")
         
         # Compute aligned extrinsics (Aligned World -> Camera)
-        # P_cam = T_w2c * P_world
-        # P_aligned = R_align * P_world  =>  P_world = R_align.T * P_aligned
-        # P_cam = T_w2c * (R_align.T * P_aligned)
-        # T_aligned = T_w2c * [R_align.T, 0; 0, 1]
-        
         R_align_inv = R_align.T
         T_align_inv = np.eye(4)
         T_align_inv[:3, :3] = R_align_inv
@@ -661,31 +694,40 @@ class DA3PostProcessor:
             extrinsics_aligned.append(w2c_aligned)
         extrinsics_aligned = np.stack(extrinsics_aligned)
         
+        intrinsics_final = np.stack(intrinsics)
+        
         metadata_path = output_dir / "scene_metadata.npz"
         
-        # Use estimated intrinsics scaled to original resolution
-        intrinsics_final = np.stack(intrinsics_estimated_scaled)
-        
+        # Extend bev_params to include shape so it is self-contained for coordinate conversion
+        # [x_min, z_max, res, ground_level, bev_w, bev_h]
+        bev_params_full = np.array([x_min, z_max, res, ground_level, bev_w, bev_h], dtype=np.float32)
+
         np.savez(metadata_path,
-                intrinsics=intrinsics_final,            # (N, 3, 3) - Estimated & Scaled to Original Res
-                extrinsics_aligned=extrinsics_aligned,  # (N, 4, 4) - Aligned World to Camera
-                bev_params=np.array([x_min, z_max, res, ground_level], dtype=np.float32), # [x_min, z_max, res, ground_level]
-                bev_shape=np.array([bev_w, bev_h], dtype=np.int32),
-                img_paths=np.array(valid_img_paths),
-                depth_paths=np.array(saved_depth_paths),
-                img_shapes=np.array(original_shapes)
+                intrinsics=intrinsics_final,            
+                extrinsics=extrinsics_aligned,   # Aligned World -> Camera
+                depth_paths=np.array(saved_depth_paths), 
+                bev_params=bev_params_full       # [x_min, z_max, res, ground, w, h] - Sufficient for World <-> BEV
                 )
         print(f"Scene metadata saved to {metadata_path}")
 
 
 def main():
-    # Paths
-    undistorted_dir = Path('/home/disk2/jiagangchen/LJ/process_data/undistorted_first_frames/images')
-    intrinsics_path = Path('/home/disk2/jiagangchen/LJ/process_data/intrinsics_first_frames_geocalib.json')
-    output_dir = Path('/home/disk2/jiagangchen/LJ/process_data/da3_metric_reconstruction')
+    import argparse
+    parser = argparse.ArgumentParser(description="Generate BEV from Reconstruction")
+    parser.add_argument("--reconstruction_dir", type=Path, required=True, help="Path to reconstruction directory (COLMAP + depths)")
+    parser.add_argument("--output_dir", type=Path, required=True, help="Path to output directory")
+    parser.add_argument("--resolution", type=float, default=0.01, help="Resolution in world units per pixel (default: 0.01)")
+    parser.add_argument("--target_size", type=int, default=1000, help="Target image size (max dimension). If set, resolution is auto-calculated. Set to 0 to use fixed resolution.")
+    args = parser.parse_args()
     
-    processor = DA3PostProcessor()
-    processor.run(undistorted_dir, intrinsics_path, output_dir)
+    processor = BevReconstructor()
+    processor.run(args.reconstruction_dir, args.output_dir, resolution=args.resolution, target_size=args.target_size)
 
 if __name__ == "__main__":
     main()
+
+"""
+python -m bev.bev_reconstruction \
+  --reconstruction_dir test_reconstruction_output \
+  --output_dir test_bev_output
+"""

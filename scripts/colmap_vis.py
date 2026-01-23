@@ -43,10 +43,8 @@ from viser.extras.colmap import (
 
 
 def main(
-    # colmap_path: Path = Path(__file__).parent / "../test_reconstruction_output/sparse/0",
-    # images_path: Path = Path(__file__).parent / "../test_reconstruction_output/images",
-    colmap_path: Path = Path("/data/cjg/projects/wd_projects/.worktrees/pipeline-parallel-branches/test_instantsplat_output/source/sparse_6/0"),
-    images_path: Path = Path("/data/cjg/projects/wd_projects/.worktrees/pipeline-parallel-branches/test_instantsplat_output/source/images"),
+    colmap_path: Path = Path(__file__).parent / "../test_reconstruction_output/sparse/0",
+    images_path: Path = Path(__file__).parent / "../test_reconstruction_output/images",
     downsample_factor: int = 2,
     reorient_scene: bool = True,
 ) -> None:
