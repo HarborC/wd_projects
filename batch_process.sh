@@ -43,7 +43,7 @@ for dataset_path in ${DATA_ROOT}/weidian-*; do
         python -m undistortion.factory \
             --input-dir "${dataset_path}" \
             --output-dir "${DIR_UNDISTORTED}/${dataset_name}" \
-            --backend anycalib \
+            --backend geocalib \
             --device cuda
     fi
 

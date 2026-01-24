@@ -1,7 +1,6 @@
 import json
 import torch
 import numpy as np
-import pickle
 from pathlib import Path
 from PIL import Image
 import pycolmap
@@ -20,7 +19,7 @@ def _as_homogeneous44(ext: np.ndarray) -> np.ndarray:
         return H
     raise ValueError(f"extrinsic must be (4,4) or (3,4), got {ext.shape}")
 
-def get_ground_masks(img_paths, images_u8=None):
+def get_ground_masks(img_paths):
     print("Detecting ground regions using SegFormer...")
     try:
         # Correct model name: nvidia/segformer-b0-finetuned-ade-512-512
@@ -37,13 +36,8 @@ def get_ground_masks(img_paths, images_u8=None):
         
         ground_masks = []
         
-        count = len(images_u8) if images_u8 is not None else len(img_paths)
-        for i in range(count):
-            if images_u8 is not None:
-                image = Image.fromarray(images_u8[i])
-            else:
-                image = Image.open(img_paths[i]).convert("RGB")
-
+        for p in img_paths:
+            image = Image.open(p).convert("RGB")
             inputs = processor(images=image, return_tensors="pt").to(device)
             
             with torch.no_grad():
@@ -71,54 +65,6 @@ def get_ground_masks(img_paths, images_u8=None):
         print(f"Warning: Failed to load SegFormer or detect ground ({e}). Falling back to geometric alignment.")
         return None
 
-def load_reconstruction_from_pkl(pkl_path: Path):
-    print(f"Loading reconstruction from {pkl_path}...")
-    with open(pkl_path, 'rb') as f:
-        results = pickle.load(f)
-        
-    forward = results['forward_results']
-    
-    images_u8 = forward['imgs']
-    if images_u8.dtype != np.uint8:
-        if images_u8.max() <= 1.05:
-            images_u8 = (images_u8 * 255).astype(np.uint8)
-        else:
-            images_u8 = images_u8.astype(np.uint8)
-             
-    depths = forward['depths']
-    if depths.ndim == 4:
-        depths = depths.squeeze(-1)
-        
-    intrinsics = forward['intrs']
-    extrinsics_w2c = forward['poses']
-    
-    confs = forward.get('depths_conf', None)
-    
-    img_names = results.get('image_names', [f"{i:04d}.jpg" for i in range(len(images_u8))])
-    
-    possible_img_dirs = [
-        pkl_path.parent / "images",
-        pkl_path.parent.parent / "images",
-        pkl_path.parent.parent.parent / "images"
-    ]
-    
-    found_dir = None
-    for d in possible_img_dirs:
-        name0 = Path(img_names[0]).name
-        if d.exists() and (d / name0).exists():
-            found_dir = d
-            break
-            
-    if found_dir:
-        img_paths = [str(found_dir / Path(name).name) for name in img_names]
-        print(f"Found images at {found_dir}")
-    else:
-        print("Warning: Could not locate image files on disk. Using in-memory images.")
-        img_paths = [str(pkl_path.parent / Path(name).name) for name in img_names]
-
-    print(f"Loaded {len(img_paths)} frames from pickle.")
-    return img_paths, list(intrinsics), list(extrinsics_w2c), list(depths), list(images_u8), list(confs) if confs is not None else None
-
 def load_reconstruction_data(reconstruction_dir: Path):
     """
     Load data from a reconstruction directory (COLMAP format + depths).
@@ -128,15 +74,6 @@ def load_reconstruction_data(reconstruction_dir: Path):
       - reconstruction_dir/depths/ (Depth maps as .npy)
       - reconstruction_dir/depths/ (Optional: Confidence maps as _conf.npy)
     """
-    # 0. Check for results.pkl
-    pkl_path = reconstruction_dir / "results.pkl"
-    if pkl_path.exists():
-        return load_reconstruction_from_pkl(pkl_path)
-    
-    candidates = list(reconstruction_dir.glob("*/results.pkl"))
-    if candidates:
-        return load_reconstruction_from_pkl(candidates[0])
-
     sparse_dir = reconstruction_dir / "sparse" / "0"
     if not sparse_dir.exists():
         # Try without '0'
@@ -645,7 +582,7 @@ class BevReconstructor:
                  print(f"Confidence threshold (1st percentile of sample): {conf_thresh:.4f}")
         
         # 4.5 Detect Ground Masks
-        ground_masks = get_ground_masks(img_paths, images_u8=images_u8)
+        ground_masks = get_ground_masks(img_paths)
         
         # 5. Generate Point Cloud
         all_points_world, all_colors, ground_points_world = generate_point_cloud(

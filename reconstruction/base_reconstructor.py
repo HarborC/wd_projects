@@ -14,6 +14,8 @@ import shutil
 from PIL import Image
 from plyfile import PlyData, PlyElement
 import os
+import pickle
+
 
 logger = logging.getLogger(__name__)
 
@@ -96,6 +98,13 @@ class BaseReconstructor(ABC):
         """
         image_files = self._load_imagefiles(Path(input_dir))
         results = self._process(input_dir, output_dir, image_files, **kwargs)
+
+        # save results to output_path / "results.pkl"
+        results_path = Path(output_dir) / "results.pkl"
+        with open(results_path, "wb") as f:
+            pickle.dump(results, f)
+        logger.info(f"Saved results to {results_path}")
+
         self._copy_images(image_files, output_dir)
         self._save_depth_maps(results, output_dir)
         self._save_normal_maps(results, output_dir)
