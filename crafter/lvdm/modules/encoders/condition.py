@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import os
 import kornia
 import open_clip
 from torch.utils.checkpoint import checkpoint
@@ -60,6 +61,14 @@ class FrozenT5Embedder(AbstractEncoder):
     def __init__(self, version="google/t5-v1_1-large", device="cuda", max_length=77,
                  freeze=True):  # others are google/t5-v1_1-xl and google/t5-v1_1-xxl
         super().__init__()
+        
+        # Check for local checkpoint in ../../../../checkpoints/
+        # Current file: .../crafter/lvdm/modules/encoders/condition.py
+        local_ckpt = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../../checkpoints", version.replace("/", "_")))
+        if os.path.exists(local_ckpt):
+            print(f"Using local T5 checkpoint: {local_ckpt}")
+            version = local_ckpt
+            
         self.tokenizer = T5Tokenizer.from_pretrained(version)
         self.transformer = T5EncoderModel.from_pretrained(version)
         self.device = device
@@ -98,6 +107,13 @@ class FrozenCLIPEmbedder(AbstractEncoder):
                  freeze=True, layer="last", layer_idx=None):  # clip-vit-base-patch32
         super().__init__()
         assert layer in self.LAYERS
+        
+        # Check for local checkpoint in ../../../../checkpoints/
+        local_ckpt = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../../checkpoints", version.replace("/", "_")))
+        if os.path.exists(local_ckpt):
+            print(f"Using local CLIP checkpoint: {local_ckpt}")
+            version = local_ckpt
+            
         self.tokenizer = CLIPTokenizer.from_pretrained(version)
         self.transformer = CLIPTextModel.from_pretrained(version)
         self.device = device

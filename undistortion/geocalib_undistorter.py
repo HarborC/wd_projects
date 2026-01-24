@@ -47,8 +47,20 @@ class GeoCalibUndistorter(BaseUndistorter):
 
         logger.info(f"Initializing GeoCalib backend on {self.device} with weights='{self.weights}'")
 
+        # Automatically check for local checkpoint if using default key
+        weights_to_use = self.weights
+        if self.weights == "distorted":
+            # Search for local checkpoint in project structure
+            # Current file is in PROJECT/undistortion/geocalib_undistorter.py
+            project_root = Path(__file__).parent.parent
+            local_ckpt = project_root / "checkpoints" / "geocalib" / "geocalib-distorted.tar"
+            
+            if local_ckpt.exists():
+                logger.info(f"Found local GeoCalib checkpoint at {local_ckpt}, using it instead of downloading.")
+                weights_to_use = str(local_ckpt)
+        
         from geocalib import GeoCalib
-        self.model = GeoCalib(weights=self.weights).to(self.device)
+        self.model = GeoCalib(weights=weights_to_use).to(self.device)
         self.model.eval()
 
     def _calibrate(self, image: torch.Tensor) -> Dict:

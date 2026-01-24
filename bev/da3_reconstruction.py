@@ -85,7 +85,14 @@ def run_inference(valid_img_paths, output_dir):
     # Initialize Depth Anything 3
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f"Initializing DepthAnything3 (da3nested-giant-large) on {device}...")
-    model = DepthAnything3.from_pretrained("depth-anything/DA3NESTED-GIANT-LARGE")
+    
+    model_name = "depth-anything/DA3NESTED-GIANT-LARGE"
+    local_ckpt = Path(__file__).resolve().parent.parent / "checkpoints" / model_name.replace("/", "_")
+    if local_ckpt.exists():
+        print(f"Using local DepthAnything3 checkpoint: {local_ckpt}")
+        model_name = str(local_ckpt)
+        
+    model = DepthAnything3.from_pretrained(model_name)
     model = model.eval()
     model = model.to(device=device)
 

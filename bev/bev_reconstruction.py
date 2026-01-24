@@ -25,6 +25,13 @@ def get_ground_masks(img_paths, images_u8=None):
     try:
         # Correct model name: nvidia/segformer-b0-finetuned-ade-512-512
         model_name = "nvidia/segformer-b0-finetuned-ade-512-512"
+        
+        # Check for local checkpoint in ../checkpoints
+        local_ckpt = Path(__file__).resolve().parent.parent / "checkpoints" / model_name.replace("/", "_")
+        if local_ckpt.exists():
+            print(f"Using local SegFormer checkpoint: {local_ckpt}")
+            model_name = str(local_ckpt)
+            
         processor = SegformerImageProcessor.from_pretrained(model_name)
         model = SegformerForSemanticSegmentation.from_pretrained(model_name)
         

@@ -25,18 +25,31 @@ class GeoCalib(nn.Module):
             (from siclib.models.extractor import GeoCalib).
         """
         super().__init__()
+        
+        state_dict = None
+        
+        # Priority 1: Check project-specific checkpoints folder
         if weights in {"pinhole", "distorted"}:
-            url = f"https://github.com/cvg/GeoCalib/releases/download/v1.0/geocalib-{weights}.tar"
+            # Path: .../wd_projects/undistortion/GeoCalib/geocalib/extractor.py
+            # Target: .../wd_projects/checkpoints/geocalib/geocalib-{weights}.tar
+            local_path = Path(__file__).resolve().parent.parent.parent.parent / "checkpoints" / "geocalib" / f"geocalib-{weights}.tar"
+            if local_path.exists():
+                print(f"[GeoCalib] Found local checkpoint at {local_path}")
+                state_dict = torch.load(local_path, map_location="cpu")
+                
+        if state_dict is None:
+            if weights in {"pinhole", "distorted"}:
+                url = f"https://github.com/cvg/GeoCalib/releases/download/v1.0/geocalib-{weights}.tar"
 
-            # load checkpoint
-            model_dir = f"{torch.hub.get_dir()}/geocalib"
-            state_dict = torch.hub.load_state_dict_from_url(
-                url, model_dir, map_location="cpu", file_name=f"{weights}.tar"
-            )
-        elif Path(weights).exists():
-            state_dict = torch.load(weights, map_location="cpu")
-        else:
-            raise ValueError(f"Invalid weights: {weights}")
+                # load checkpoint
+                model_dir = f"{torch.hub.get_dir()}/geocalib"
+                state_dict = torch.hub.load_state_dict_from_url(
+                    url, model_dir, map_location="cpu", file_name=f"{weights}.tar"
+                )
+            elif Path(weights).exists():
+                state_dict = torch.load(weights, map_location="cpu")
+            else:
+                raise ValueError(f"Invalid weights: {weights}")
 
         self.model = Model()
         self.model.flexible_load(state_dict["model"])
